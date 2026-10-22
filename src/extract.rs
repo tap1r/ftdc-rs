@@ -37,7 +37,6 @@
 //! and `field_increment`, seconds then increment.
 
 use crate::errors::FileDecoderError;
-use anyhow::anyhow;
 use bson::{Bson, Document};
 
 #[derive(Debug)]
@@ -271,6 +270,6 @@ pub(crate) fn extract_metric_meta_data(
             extract_metric_data_from_doc("", bson_doc, &mut ret_metrics);
             Ok(ret_metrics)
         }
-        Err(e) => Err(FileDecoderError::Other(anyhow!(e))),
+        Err(e) => Err(FileDecoderError::format(e.to_string())),
     }
 }

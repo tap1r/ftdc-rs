@@ -55,7 +55,6 @@
 use crate::errors::FileDecoderError;
 use crate::extract::MetricData;
 use crate::varint::{RangeCursor, unpack};
-use anyhow::anyhow;
 use indexmap::IndexMap;
 use std::collections::HashSet;
 use zune_inflate::DeflateDecoder;
@@ -69,14 +68,14 @@ const MAX_METRIC_SAMPLES: usize = 1_000_000;
 /// front of the zlib stream. A blob shorter than that is not a metric chunk.
 pub(crate) fn inflate_owned(bytes: Vec<u8>) -> Result<Vec<u8>, FileDecoderError> {
     if bytes.len() < 4 {
-        return Err(FileDecoderError::Other(anyhow!(
+        return Err(FileDecoderError::format(format!(
             "metric blob is shorter than the 4-byte uncompressed size"
         )));
     }
     let mut decoder = DeflateDecoder::new(&bytes[4..]);
     match decoder.decode_zlib() {
         Ok(encoded_data) => Ok(encoded_data),
-        Err(error) => Err(FileDecoderError::Other(anyhow!(
+        Err(error) => Err(FileDecoderError::format(format!(
             "zlib inflate of an FTDC metric chunk failed: {error}"
         ))),
     }
@@ -89,13 +88,13 @@ pub(crate) fn inflate_owned(bytes: Vec<u8>) -> Result<Vec<u8>, FileDecoderError>
 /// those eight bytes is truncated.
 pub(crate) fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDecoderError> {
     if data.len() < 4 {
-        return Err(FileDecoderError::Other(anyhow!(
+        return Err(FileDecoderError::format(format!(
             "inflated metric chunk is shorter than a BSON length"
         )));
     }
     let data_size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     if data_size < 5 || data.len() < data_size.saturating_add(8) {
-        return Err(FileDecoderError::Other(anyhow!(
+        return Err(FileDecoderError::format(format!(
             "inflated metric chunk does not contain metric_count and sample_count"
         )));
     }
@@ -104,7 +103,7 @@ pub(crate) fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDeco
     let sample_count =
         u32::from_le_bytes(data[data_size + 4..data_size + 8].try_into().unwrap()) as usize;
     if metric_count.saturating_mul(sample_count) > MAX_METRIC_SAMPLES {
-        return Err(FileDecoderError::Other(anyhow!(
+        return Err(FileDecoderError::format(format!(
             "metric_count {metric_count} and sample_count {sample_count} exceed the FTDC limit"
         )));
     }
@@ -135,7 +134,7 @@ pub(crate) fn extract_all_metrics_from_buffer(
             .last()
             .map(|metric| metric.name.as_str())
             .unwrap_or("(none)");
-        return Err(FileDecoderError::Other(anyhow!(
+        return Err(FileDecoderError::format(format!(
             "extracted {} metrics from the reference document, but the chunk header says {metric_count}. \
              Deltas are positional, so these lengths have to match or every later series is built from the wrong column. \
              First extracted name is '{first}', last is '{last}'.",
@@ -145,7 +144,7 @@ pub(crate) fn extract_all_metrics_from_buffer(
 
     let offset = doc_size + 8;
     if offset > buffer.len() {
-        return Err(FileDecoderError::Other(anyhow!(
+        return Err(FileDecoderError::format(format!(
             "metric chunk header points past the end of the inflated buffer"
         )));
     }
@@ -206,7 +205,7 @@ pub(crate) fn decode_one_chunk(
     let mut columns = Vec::with_capacity(metric_data.len());
     for metric in metric_data {
         let Some(samples) = metric.data else {
-            return Err(FileDecoderError::Other(anyhow!(
+            return Err(FileDecoderError::format(format!(
                 "metric '{}' produced no samples",
                 metric.name
             )));
@@ -250,7 +249,7 @@ pub(crate) fn append_chunk(
 
     for (name, samples) in columns {
         if samples.len() != height {
-            return Err(FileDecoderError::Other(anyhow!(
+            return Err(FileDecoderError::format(format!(
                 "metric '{name}' has {} samples in a chunk whose other metrics have {height}",
                 samples.len()
             )));

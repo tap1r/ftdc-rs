@@ -734,4 +734,77 @@ mod tests {
         let _ = std::fs::remove_file(&second);
         let _ = std::fs::remove_file(&ordered);
     }
+
+    /// The sidecar lists every type 0 and type 2 document as relaxed
+    /// extended JSON. The last document of each kind used to be stored
+    /// alone, as `Document`'s `Display` text, and a type 2 delta was
+    /// labelled `parameters`.
+    #[test]
+    fn metadata_sidecar_is_extended_json_of_every_document() {
+        let chunk = write_one_chunk(&bson::doc! { "n": 4i32 }, 1, 0, &[]);
+        let mut bytes = Vec::new();
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(0),
+            "type": 0i32,
+            "doc": { "host": "a.example" }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(1),
+            "type": 2i32,
+            "count": 0i32,
+            "doc": { "param": 1i32 }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(2),
+            "type": 9i32,
+            "doc": { "future": true }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+        bytes.extend(std::fs::read(&chunk).unwrap());
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(3),
+            "type": 2i32,
+            "count": 1i32,
+            "doc": { "param": 2i32 }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+
+        let dir = std::env::temp_dir();
+        let input = dir.join(format!("ftdc-rs-meta-in-{}.bin", std::process::id()));
+        let parquet = dir.join(format!("ftdc-rs-meta-{}.parquet", std::process::id()));
+        let sidecar = dir.join(format!("ftdc-rs-meta-{}.metadata.json", std::process::id()));
+        std::fs::write(&input, bytes).unwrap();
+
+        FTDCFileDecoder::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert!(json.get("parameters").is_none());
+        assert_eq!(json["metadata"].as_array().unwrap().len(), 1);
+        assert_eq!(json["metadata"][0]["host"], "a.example");
+        assert_eq!(json["metadataDeltas"].as_array().unwrap().len(), 2);
+        assert_eq!(json["metadataDeltas"][0]["param"], serde_json::json!(1));
+        assert_eq!(json["metadataDeltas"][1]["param"], serde_json::json!(2));
+        assert_eq!(json["documentCount"], serde_json::json!(5));
+        assert_eq!(json["skippedChunkTypes"], serde_json::json!([9]));
+        assert_eq!(json["metrics"], serde_json::json!(["n"]));
+
+        use polars::prelude::SerReader;
+        let mut file = std::fs::File::open(&parquet).unwrap();
+        let frame = polars::prelude::ParquetReader::new(&mut file)
+            .finish()
+            .unwrap();
+        assert_eq!(frame.column("n").unwrap().u64().unwrap().get(0), Some(4));
+
+        let _ = std::fs::remove_file(&chunk);
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&parquet);
+        let _ = std::fs::remove_file(&sidecar);
+    }
 }

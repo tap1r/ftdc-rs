@@ -43,11 +43,11 @@
 use crate::decode::{append_chunk, decode_one_chunk, inflate_owned};
 use crate::errors::FileDecoderError;
 use crate::export::write_metrics_parquet;
-use anyhow::anyhow;
 use bson::{Binary, Bson, Document};
 use indexmap::IndexMap;
 use regex::Regex;
 use std::io::{BufReader, Read};
+use std::path::Path;
 use std::thread;
 
 /// `type` values on the BSON documents concatenated inside an FTDC archive.
@@ -94,19 +94,23 @@ fn read_length_prefixed_document<R: Read>(
         match reader.read(&mut len_buf[filled..]) {
             Ok(0) if filled == 0 => return Ok(None),
             Ok(0) => {
-                return Err(FileDecoderError::Other(anyhow!(
+                return Err(FileDecoderError::format(format!(
                     "FTDC archive ends in the middle of a BSON document length ({filled} of 4 bytes)"
                 )));
             }
             Ok(n) => filled += n,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(FileDecoderError::FileIOError(error)),
+            Err(error) => {
+                return Err(FileDecoderError::format(format!(
+                    "failed to read FTDC archive: {error}"
+                )));
+            }
         }
     }
 
     let doc_len = i32::from_le_bytes(len_buf);
     if doc_len < 5 {
-        return Err(FileDecoderError::Other(anyhow!(
+        return Err(FileDecoderError::format(format!(
             "BSON document length {doc_len} is smaller than 5"
         )));
     }
@@ -116,10 +120,10 @@ fn read_length_prefixed_document<R: Read>(
     body[..4].copy_from_slice(&len_buf);
     if let Err(error) = reader.read_exact(&mut body[4..]) {
         return Err(match error.kind() {
-            std::io::ErrorKind::UnexpectedEof => FileDecoderError::Other(anyhow!(
+            std::io::ErrorKind::UnexpectedEof => FileDecoderError::format(format!(
                 "FTDC archive ends in the middle of a BSON document of {doc_len} bytes"
             )),
-            _ => FileDecoderError::FileIOError(error),
+            _ => FileDecoderError::format(format!("failed to read FTDC archive: {error}")),
         });
     }
 
@@ -127,7 +131,7 @@ fn read_length_prefixed_document<R: Read>(
     Document::from_reader(&mut cursor)
         .map(Some)
         .map_err(|error| {
-            FileDecoderError::Other(anyhow!(
+            FileDecoderError::format(format!(
                 "FTDC archive contains a BSON document that does not parse: {error}"
             ))
         })
@@ -152,10 +156,11 @@ impl FTDCFileDecoder {
     /// # Arguments
     ///
     /// * `file_name` - The file to read
-    pub fn read_file(&mut self, file_name: &str) -> Result<(), FileDecoderError> {
+    pub fn read_file(&mut self, file_name: impl AsRef<Path>) -> Result<(), FileDecoderError> {
+        let file_name = file_name.as_ref();
         let file = match std::fs::File::open(file_name) {
             Ok(file) => file,
-            Err(error) => return Err(FileDecoderError::FileIOError(error)),
+            Err(error) => return Err(FileDecoderError::io("failed to open", file_name, error)),
         };
         // The archive is read front to back, one document at a time. The
         // buffer only cuts down the number of reads; each document's own
@@ -222,7 +227,7 @@ impl FTDCFileDecoder {
         for handle in handles {
             let chunk = handle
                 .join()
-                .map_err(|_| FileDecoderError::Other(anyhow!("FTDC inflate thread panicked")))??;
+                .map_err(|_| FileDecoderError::format(format!("FTDC inflate thread panicked")))??;
             inflated.push(chunk);
         }
         Ok(inflated)
@@ -231,15 +236,10 @@ impl FTDCFileDecoder {
     /// Reads an FTDC file and decompresses the data bearing documents in it.
     pub fn read_and_uncompress(
         &mut self,
-        file_name: &str,
+        file_name: impl AsRef<Path>,
     ) -> Result<Vec<Vec<u8>>, FileDecoderError> {
-        match self.read_file(file_name) {
-            Ok(_) => self.uncompress_data(),
-            Err(e) => {
-                println!("Got expected error {e:?}");
-                Err(e)
-            }
-        }
+        self.read_file(file_name)?;
+        self.uncompress_data()
     }
 
     /// Decode inflated chunks and append each metric in file order.
@@ -269,7 +269,7 @@ impl FTDCFileDecoder {
         for handle in handles {
             let metrics = handle
                 .join()
-                .map_err(|_| FileDecoderError::Other(anyhow!("FTDC decode thread panicked")))??;
+                .map_err(|_| FileDecoderError::format(format!("FTDC decode thread panicked")))??;
             append_chunk(&mut merged, &mut rows, metrics)?;
         }
         Ok(merged)
@@ -288,7 +288,7 @@ impl FTDCFileDecoder {
     ///   by later chunks.
     pub fn read_and_decode(
         &mut self,
-        file_name: &str,
+        file_name: impl AsRef<Path>,
         filter: Option<Regex>,
     ) -> Result<IndexMap<String, Vec<Option<u64>>>, FileDecoderError> {
         let data_chunks = self.read_and_uncompress(file_name)?;
@@ -316,28 +316,26 @@ impl FTDCFileDecoder {
         crate::export::metrics_to_dataframe(metrics)
     }
 
-    /// Decodes an FTDC file and writes a Parquet file with the information.
+    /// Decodes an FTDC file and writes a Parquet file.
     ///
-    /// # Arguments
-    ///
-    /// * `input_file_name` - The name of the FTDC file to decode.
-    /// * `output_file_name` - The name of the file to write parquet data.
-    /// * `metadata` - An Option<&str> that if not None will be used to write metadata.
+    /// `metadata`, when set, is the path of the sidecar. It receives every
+    /// type 0 document and every type 2 document as relaxed extended JSON.
     pub fn write_to_parquet(
-        input_file_name: &str,
-        output_file_name: &str,
-        metadata: Option<&str>,
+        input_file_name: impl AsRef<Path>,
+        output_file_name: impl AsRef<Path>,
+        metadata: Option<&Path>,
         filter: Option<Regex>,
     ) -> Result<(), FileDecoderError> {
         let mut parsed_file = FTDCFileDecoder::new();
         let metrics = parsed_file.read_and_decode(input_file_name, filter)?;
         write_metrics_parquet(
             metrics,
-            output_file_name,
+            output_file_name.as_ref(),
             metadata,
             &parsed_file.metadata_docs,
             &parsed_file.metadata_deltas,
             parsed_file.document_count,
+            &parsed_file.skipped_chunk_types,
         )
     }
 }
@@ -351,12 +349,12 @@ fn chunk_type_of(doc: &Document) -> Result<i32, FileDecoderError> {
     match doc.get("type") {
         Some(Bson::Int32(value)) => Ok(*value),
         Some(Bson::Int64(value)) => i32::try_from(*value).map_err(|_| {
-            FileDecoderError::Other(anyhow!("FTDC chunk type {value} does not fit in an int32"))
+            FileDecoderError::format(format!("FTDC chunk type {value} does not fit in an int32"))
         }),
-        Some(other) => Err(FileDecoderError::Other(anyhow!(
+        Some(other) => Err(FileDecoderError::format(format!(
             "FTDC chunk type is {other:?}, expected an int"
         ))),
-        None => Err(FileDecoderError::Other(anyhow!(
+        None => Err(FileDecoderError::format(format!(
             "'type' key not found in chunk"
         ))),
     }
@@ -370,10 +368,10 @@ fn chunk_type_of(doc: &Document) -> Result<i32, FileDecoderError> {
 fn embedded_doc(doc: &Document, key: &str, kind: &str) -> Result<Document, FileDecoderError> {
     match doc.get(key) {
         Some(Bson::Document(inner)) => Ok(inner.clone()),
-        Some(other) => Err(FileDecoderError::Other(anyhow!(
+        Some(other) => Err(FileDecoderError::format(format!(
             "'{key}' in an FTDC {kind} chunk is {other:?}, expected a document"
         ))),
-        None => Err(FileDecoderError::Other(anyhow!(
+        None => Err(FileDecoderError::format(format!(
             "'{key}' key not found in an FTDC {kind} chunk"
         ))),
     }
@@ -387,10 +385,10 @@ fn embedded_doc(doc: &Document, key: &str, kind: &str) -> Result<Document, FileD
 fn metric_blob(doc: &Document) -> Result<Binary, FileDecoderError> {
     match doc.get("data") {
         Some(Bson::Binary(blob)) => Ok(blob.clone()),
-        Some(other) => Err(FileDecoderError::Other(anyhow!(
+        Some(other) => Err(FileDecoderError::format(format!(
             "'data' in an FTDC metric chunk is {other:?}, expected BinData"
         ))),
-        None => Err(FileDecoderError::Other(anyhow!(
+        None => Err(FileDecoderError::format(format!(
             "'data' key not found in an FTDC metric chunk"
         ))),
     }
