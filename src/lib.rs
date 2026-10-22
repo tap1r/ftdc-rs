@@ -8,7 +8,7 @@ use buffered_reader;
 use buffered_reader::BufferedReader;
 use polars::prelude::*;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread;
 use zune_inflate::DeflateDecoder;
 
@@ -163,6 +163,62 @@ fn decode_one_chunk(chunk: Vec<u8>) -> Result<Vec<(String, Vec<u64>)>, FileDecod
         columns.push((name, samples));
     }
     Ok(columns)
+}
+
+/// Append one chunk's columns to the file-level series.
+///
+/// `rows` is the number of samples already stored. Every column of this
+/// chunk has the same length, because one chunk is one rectangular
+/// block: `sample_count + 1` rows and `metric_count` columns.
+///
+/// A name that was not in earlier chunks gets `rows` leading nulls, then
+/// its values. Those nulls are "this metric did not exist yet", which is
+/// what the server does when the schema changes and it closes the chunk.
+/// Putting the new values at the start of the column, and filling the
+/// tail with 0, lines the new metric up with the wrong time and looks
+/// like a real zero.
+///
+/// A name that was in earlier chunks but is absent from this one gets
+/// the same number of trailing nulls. The schema changed the other way:
+/// the metric went away. A zero there would look like the counter reset.
+fn append_chunk(
+    merged: &mut HashMap<String, Vec<Option<u64>>>,
+    rows: &mut usize,
+    columns: Vec<(String, Vec<u64>)>,
+) -> Result<(), FileDecoderError> {
+    let height = columns
+        .first()
+        .map(|(_, samples)| samples.len())
+        .unwrap_or(0);
+    let mut present = HashSet::with_capacity(columns.len());
+
+    for (name, samples) in columns {
+        if samples.len() != height {
+            return Err(FileDecoderError::Other(anyhow!(
+                "metric '{name}' has {} samples in a chunk whose other metrics have {height}",
+                samples.len()
+            )));
+        }
+        present.insert(name.clone());
+        match merged.get_mut(&name) {
+            Some(existing) => existing.extend(samples.into_iter().map(Some)),
+            None => {
+                let mut series = Vec::with_capacity(*rows + height);
+                series.resize(*rows, None);
+                series.extend(samples.into_iter().map(Some));
+                merged.insert(name, series);
+            }
+        }
+    }
+
+    let end = *rows + height;
+    for (name, series) in merged.iter_mut() {
+        if !present.contains(name) {
+            series.resize(end, None);
+        }
+    }
+    *rows = end;
+    Ok(())
 }
 
 fn push_metric(name: &str, initial: u64, metric_type: Bson, out: &mut Vec<MetricData>) {
@@ -684,23 +740,21 @@ impl FTDCFileDecoder {
     pub fn decode_decompressed_data_chunks(
         &self,
         data_chunks: Vec<Vec<u8>>,
-    ) -> Result<HashMap<String, Vec<u64>>, FileDecoderError> {
+    ) -> Result<HashMap<String, Vec<Option<u64>>>, FileDecoderError> {
         let mut handles = Vec::with_capacity(data_chunks.len());
         for chunk in data_chunks {
             handles.push(thread::spawn(move || decode_one_chunk(chunk)));
         }
 
-        let mut merged: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut merged: HashMap<String, Vec<Option<u64>>> = HashMap::new();
+        // How many samples the chunks already appended account for.
+        // A metric that first appears later is null for these rows.
+        let mut rows = 0usize;
         for handle in handles {
             let metrics = handle
                 .join()
                 .map_err(|_| FileDecoderError::Other(anyhow!("FTDC decode thread panicked")))??;
-            for (name, mut samples) in metrics {
-                merged
-                    .entry(name)
-                    .or_insert_with(|| Vec::with_capacity(Self::INITIAL_METRIC_CAPACITY))
-                    .append(&mut samples);
-            }
+            append_chunk(&mut merged, &mut rows, metrics)?;
         }
         Ok(merged)
     }
@@ -719,13 +773,13 @@ impl FTDCFileDecoder {
         &mut self,
         file_name: &str,
         filter: Option<Regex>,
-    ) -> Result<HashMap<String, Vec<u64>>, FileDecoderError> {
+    ) -> Result<HashMap<String, Vec<Option<u64>>>, FileDecoderError> {
         let data_chunks = self.read_and_uncompress(file_name)?;
         let decoded_data = self.decode_decompressed_data_chunks(data_chunks)?;
 
         match filter {
             Some(re) => {
-                let mut matched_data: HashMap<String, Vec<u64>> = HashMap::new();
+                let mut matched_data: HashMap<String, Vec<Option<u64>>> = HashMap::new();
 
                 for (key, value) in decoded_data {
                     if re.is_match(&key) {
@@ -738,33 +792,33 @@ impl FTDCFileDecoder {
         }
     }
 
-    /// Converts a HashMap<String, Vec<u64>> to a polars DataFrame
+    /// Build a DataFrame whose columns are the decoded series.
     ///
-    /// # Arguments
-    /// * `metrics` - A HashMap where keys are metric names and values are vectors of u64 values
-    ///
-    /// # Returns
-    /// * `Result<DataFrame, FileDecoderError>` - A polars DataFrame with columns named after the keys in the hashmap
+    /// A missing sample is `None`, which Parquet stores as a null. It is
+    /// not 0. A lot of FTDC counters sit at 0 for long stretches, so a
+    /// filler zero cannot be told apart from a real sample. Callers align
+    /// the series first ([`append_chunk`] does this while merging chunks).
+    /// A map whose columns have different lengths is rejected rather than
+    /// padded.
     pub fn metrics_to_dataframe(
-        metrics: HashMap<String, Vec<u64>>,
+        metrics: HashMap<String, Vec<Option<u64>>>,
     ) -> Result<DataFrame, FileDecoderError> {
-        // Create a vector to hold our Series objects
         let mut series_vec: Vec<Series> = Vec::new();
 
-        // Find the maximum length of any vector in the hashmap to determine row count
-        let max_len = metrics.values().map(|v| v.len()).max().unwrap_or(0);
-
-        // Create a Series for each key-value pair in the hashmap
-        for (key, values) in metrics {
-            // If the vector is shorter than max_len, pad it with zeros
-            let mut padded_values = values.clone();
-            if padded_values.len() < max_len {
-                padded_values.resize(max_len, 0);
+        let height = metrics.values().map(Vec::len).max().unwrap_or(0);
+        for (key, values) in &metrics {
+            if values.len() != height {
+                return Err(FileDecoderError::Other(anyhow!(
+                    "series '{key}' has {} samples but another series has {height}. \
+                     A sample that did not exist is null, not 0, and it has to be \
+                     inserted on the side where the metric was absent.",
+                    values.len()
+                )));
             }
+        }
 
-            // Create a Series from the vector and add it to our vector of Series
-            // Convert the key to PlSmallStr using .into() without the &
-            let series = Series::new(key.into(), padded_values);
+        for (key, values) in metrics {
+            let series = Series::new(key.into(), values);
             series_vec.push(series);
         }
 
@@ -1209,11 +1263,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             series.get("a").map(Vec::as_slice),
-            Some([1, 2, 3, 4].as_slice())
+            Some([Some(1), Some(2), Some(3), Some(4)].as_slice())
         );
         assert_eq!(
             series.get("x").map(Vec::as_slice),
-            Some([2, 2, 2, 2].as_slice())
+            Some([Some(2), Some(2), Some(2), Some(2)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
 
@@ -1222,8 +1276,14 @@ mod tests {
         let series = parsed
             .read_and_decode(reference_only.to_str().unwrap(), None)
             .unwrap();
-        assert_eq!(series.get("a").map(Vec::as_slice), Some([1].as_slice()));
-        assert_eq!(series.get("x").map(Vec::as_slice), Some([2].as_slice()));
+        assert_eq!(
+            series.get("a").map(Vec::as_slice),
+            Some([Some(1)].as_slice())
+        );
+        assert_eq!(
+            series.get("x").map(Vec::as_slice),
+            Some([Some(2)].as_slice())
+        );
         let _ = std::fs::remove_file(&reference_only);
 
         let wide = bson::doc! { "n": 0i64 };
@@ -1234,8 +1294,8 @@ mod tests {
             .unwrap();
         let values = series.get("n").expect("metric n");
         assert_eq!(values.len(), 301);
-        assert_eq!(values[0], 0);
-        assert_eq!(values[300], 300);
+        assert_eq!(values[0], Some(0));
+        assert_eq!(values[300], Some(300));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1257,8 +1317,14 @@ mod tests {
             .read_and_decode(path.to_str().unwrap(), None)
             .unwrap();
         assert_eq!(series.len(), 2, "objectid and string must not be columns");
-        assert_eq!(series.get("n").map(Vec::as_slice), Some([7].as_slice()));
-        assert_eq!(series.get("ok").map(Vec::as_slice), Some([1].as_slice()));
+        assert_eq!(
+            series.get("n").map(Vec::as_slice),
+            Some([Some(7)].as_slice())
+        );
+        assert_eq!(
+            series.get("ok").map(Vec::as_slice),
+            Some([Some(1)].as_slice())
+        );
         assert!(!series.contains_key("id"));
         assert!(!series.contains_key("label"));
         let _ = std::fs::remove_file(&path);
@@ -1288,7 +1354,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             series.get("amount").map(Vec::as_slice),
-            Some([42].as_slice())
+            Some([Some(42)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
 
@@ -1302,11 +1368,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             series.get("members.0.health").map(Vec::as_slice),
-            Some([1].as_slice())
+            Some([Some(1)].as_slice())
         );
         assert_eq!(
             series.get("members.1.health").map(Vec::as_slice),
-            Some([2].as_slice())
+            Some([Some(2)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
 
@@ -1336,7 +1402,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             series.get("n").map(Vec::as_slice),
-            Some([10, 20].as_slice()),
+            Some([Some(10), Some(20)].as_slice()),
             "chunk 0's sample has to come before chunk 1's"
         );
         let _ = std::fs::remove_file(&first);
@@ -1354,48 +1420,77 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A metric that appears in a later chunk is null until then. A metric
+    /// that disappears is null afterwards. Neither side is filled with 0.
+    #[test]
+    fn schema_changes_are_null_not_zero() {
+        let only_a = write_one_chunk(&bson::doc! { "a": 1i32 }, 1, 0, &[]);
+        let a_and_b = write_one_chunk(&bson::doc! { "a": 2i32, "b": 3i32 }, 2, 0, &[]);
+        let only_b = write_one_chunk(&bson::doc! { "b": 4i32 }, 1, 0, &[]);
+        let mut bytes = std::fs::read(&only_a).unwrap();
+        bytes.extend(std::fs::read(&a_and_b).unwrap());
+        bytes.extend(std::fs::read(&only_b).unwrap());
+        let path = std::env::temp_dir().join(format!("ftdc-rs-nulls-{}.bin", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            series.get("a").map(Vec::as_slice),
+            Some([Some(1), Some(2), None].as_slice())
+        );
+        assert_eq!(
+            series.get("b").map(Vec::as_slice),
+            Some([None, Some(3), Some(4)].as_slice())
+        );
+
+        let df = FTDCFileDecoder::metrics_to_dataframe(series).unwrap();
+        assert_eq!(df.height(), 3);
+        assert_eq!(df.column("b").unwrap().u64().unwrap().get(0), None);
+        assert_eq!(df.column("a").unwrap().u64().unwrap().get(2), None);
+
+        let _ = std::fs::remove_file(&only_a);
+        let _ = std::fs::remove_file(&a_and_b);
+        let _ = std::fs::remove_file(&only_b);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn test_to_dataframe() {
-        // Create a test HashMap with some data
-        let mut test_metrics: HashMap<String, Vec<u64>> = HashMap::new();
-        test_metrics.insert("metric1".to_string(), vec![1, 2, 3, 4, 5]);
-        test_metrics.insert("metric2".to_string(), vec![10, 20, 30, 40, 50]);
-        test_metrics.insert("metric3".to_string(), vec![100, 200, 300]); // Shorter vector to test padding
+        let mut test_metrics: HashMap<String, Vec<Option<u64>>> = HashMap::new();
+        test_metrics.insert(
+            "metric1".to_string(),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+        );
+        test_metrics.insert(
+            "metric2".to_string(),
+            vec![Some(10), Some(20), Some(30), Some(40), Some(50)],
+        );
+        // Already aligned. The nulls are the samples that did not exist.
+        // The builder must not turn them into 0.
+        test_metrics.insert(
+            "metric3".to_string(),
+            vec![Some(100), Some(200), Some(300), None, None],
+        );
 
-        // Convert the HashMap to a DataFrame
-        let df_result = FTDCFileDecoder::metrics_to_dataframe(test_metrics);
+        let df = FTDCFileDecoder::metrics_to_dataframe(test_metrics).unwrap();
+        assert_eq!(df.width(), 3);
+        assert_eq!(df.height(), 5);
 
-        // Verify the result is Ok
-        assert!(df_result.is_ok());
-
-        let df = df_result.unwrap();
-
-        // Verify the DataFrame has the expected structure
-        assert_eq!(df.width(), 3); // 3 columns
-        assert_eq!(df.height(), 5); // 5 rows (max length of the vectors)
-
-        // Verify column names
-        let column_names: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(column_names.contains(&"metric1".to_string()));
-        assert!(column_names.contains(&"metric2".to_string()));
-        assert!(column_names.contains(&"metric3".to_string()));
-
-        // Verify the data in the columns
         let metric1_col = df.column("metric1").unwrap();
         let metric2_col = df.column("metric2").unwrap();
         let metric3_col = df.column("metric3").unwrap();
+        assert_eq!(metric1_col.u64().unwrap().get(0), Some(1));
+        assert_eq!(metric2_col.u64().unwrap().get(0), Some(10));
+        assert_eq!(metric3_col.u64().unwrap().get(0), Some(100));
+        assert_eq!(metric3_col.u64().unwrap().get(3), None);
+        assert_eq!(metric3_col.u64().unwrap().get(4), None);
 
-        // Check first values
-        assert_eq!(metric1_col.u64().unwrap().get(0).unwrap(), 1);
-        assert_eq!(metric2_col.u64().unwrap().get(0).unwrap(), 10);
-        assert_eq!(metric3_col.u64().unwrap().get(0).unwrap(), 100);
-
-        // Check that metric3 was padded with zeros
-        assert_eq!(metric3_col.u64().unwrap().get(3).unwrap(), 0);
-        assert_eq!(metric3_col.u64().unwrap().get(4).unwrap(), 0);
+        let mut ragged = HashMap::new();
+        ragged.insert("a".to_string(), vec![Some(1u64), Some(2)]);
+        ragged.insert("b".to_string(), vec![Some(3u64)]);
+        assert!(FTDCFileDecoder::metrics_to_dataframe(ragged).is_err());
     }
 }
