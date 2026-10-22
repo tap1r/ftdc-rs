@@ -3,6 +3,9 @@
 //! Each metric is a column of `u64` values. A missing sample is `None`,
 //! which Parquet stores as a null. Many FTDC counters sit at 0 for long
 //! stretches, so a filler zero cannot be told apart from a real sample.
+//! Columns are written in the map's iteration order. That order is the
+//! order names were first seen, which is the reference document's field
+//! order.
 //! Columns of one file share one height. A map whose columns differ in
 //! length is rejected. The merge in `decode` is what inserts the nulls
 //! on the side where the metric was absent.
@@ -15,15 +18,15 @@
 use crate::errors::FileDecoderError;
 use anyhow::anyhow;
 use bson::Document;
+use indexmap::IndexMap;
 use polars::prelude::*;
-use std::collections::HashMap;
 
 /// Build a DataFrame whose columns are the decoded series.
 ///
 /// A missing sample is `None`. Callers align the series first
 /// ([`crate::decode::append_chunk`] does this while merging chunks).
 pub(crate) fn metrics_to_dataframe(
-    metrics: HashMap<String, Vec<Option<u64>>>,
+    metrics: IndexMap<String, Vec<Option<u64>>>,
 ) -> Result<DataFrame, FileDecoderError> {
     let mut series_vec: Vec<Series> = Vec::new();
 
@@ -50,7 +53,7 @@ pub(crate) fn metrics_to_dataframe(
 
 /// Write `metrics` to `output_file_name` and, when asked, the JSON sidecar.
 pub(crate) fn write_metrics_parquet(
-    metrics: HashMap<String, Vec<Option<u64>>>,
+    metrics: IndexMap<String, Vec<Option<u64>>>,
     output_file_name: &str,
     metadata_path: Option<&str>,
     metadata_docs: &[Document],
@@ -59,12 +62,15 @@ pub(crate) fn write_metrics_parquet(
 ) -> Result<(), FileDecoderError> {
     let mut df = metrics_to_dataframe(metrics)?;
 
-    let mut file = std::fs::File::create(output_file_name)
-        .map_err(|e| FileDecoderError::Other(anyhow!("Failed to create output file: {}", e)))?;
+    let mut file = std::fs::File::create(output_file_name).map_err(|error| {
+        FileDecoderError::Other(anyhow!("Failed to create output file: {}", error))
+    })?;
 
     ParquetWriter::new(&mut file)
         .finish(&mut df)
-        .map_err(|e| FileDecoderError::Other(anyhow!("Failed to write parquet file: {}", e)))?;
+        .map_err(|error| {
+            FileDecoderError::Other(anyhow!("Failed to write parquet file: {}", error))
+        })?;
 
     if let Some(metadata_file) = metadata_path {
         let metric_names: Vec<String> = df
@@ -92,12 +98,12 @@ pub(crate) fn write_metrics_parquet(
             "metrics": metric_names,
         });
 
-        let json_string = serde_json::to_string_pretty(&json_data).map_err(|e| {
-            FileDecoderError::Other(anyhow!("Failed to serialize metadata to JSON: {}", e))
+        let json_string = serde_json::to_string_pretty(&json_data).map_err(|error| {
+            FileDecoderError::Other(anyhow!("Failed to serialize metadata to JSON: {}", error))
         })?;
 
-        std::fs::write(metadata_file, json_string).map_err(|e| {
-            FileDecoderError::Other(anyhow!("Failed to write metadata file: {}", e))
+        std::fs::write(metadata_file, json_string).map_err(|error| {
+            FileDecoderError::Other(anyhow!("Failed to write metadata file: {}", error))
         })?;
     }
 

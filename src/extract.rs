@@ -25,9 +25,16 @@
 //! the int64 bit pattern is the metric. A negative value is therefore a
 //! large unsigned number, which is what a later wrapping delta expects.
 //!
-//! `doc_name` is the path so far. The walk prefixes every segment with a
-//! dot, including the first, because it starts from an empty parent. The
-//! chunk decoder strips that first character when it publishes the name.
+//! A double is squeezed into an int64 before that same bit cast. NaN
+//! becomes 0. A value greater than or equal to 2^63, including +Infinity,
+//! becomes `i64::MAX`. A value less than -2^63, including -Infinity,
+//! becomes `i64::MIN`. Every other value is truncated toward zero. See
+//! [`double_to_metric`].
+//!
+//! The path of a field is its own name at the root, and `parent.key` under
+//! a document or an array element. Array elements use the decimal index as
+//! the key (`members.0.health`). A timestamp's two metrics are `field_time`
+//! and `field_increment`, seconds then increment.
 
 use crate::errors::FileDecoderError;
 use anyhow::anyhow;
@@ -138,6 +145,53 @@ pub(crate) fn decimal_text_to_i64(text: &str) -> i64 {
     }
 }
 
+/// Join `key` onto `parent` the way the reference walk names a metric.
+///
+/// An empty parent means this field is at the root, so the name is `key`
+/// itself. A leading dot used to be prefixed here and stripped again when
+/// the column was published. `name.remove(0)` also deletes the first
+/// character of a name that did not have that dot.
+fn metric_path(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_string()
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+/// Reduce a double the way `FTDCBSONUtil::extractMetricsFromDocument` does.
+///
+/// The server's comment on this conversion is the rule. Doubles that fall
+/// outside int64 become:
+///
+/// * NaN → 0
+/// * +Infinity, and any value `>= 2^63`, → `i64::MAX`
+/// * -Infinity, and any value `< -2^63`, → `i64::MIN`
+///
+/// `2^63` is `BSONElement::kLongLongMaxPlusOneAsDouble`. The comparison in
+/// the server is `!(value < kLongLongMaxPlusOneAsDouble)`, after NaN has
+/// already been handled. `i64::MAX as f64` is that same `2^63`, because
+/// `2^63 - 1` is not representable and rounds up.
+///
+/// Every remaining value is truncated toward zero (`static_cast<long long>`).
+/// The int64 bit pattern is what gets stored in the `uint64_t` metric vector.
+/// Casting the double straight to `u64` turns a negative into 0 and a value
+/// past `2^63` into `u64::MAX` or the raw magnitude. Deltas were computed
+/// from the int64 bits, so that reference is the wrong base.
+pub(crate) fn double_to_metric(value: f64) -> u64 {
+    if value.is_nan() {
+        return 0;
+    }
+    let reduced = if !(value < i64::MAX as f64) {
+        i64::MAX
+    } else if value < i64::MIN as f64 {
+        i64::MIN
+    } else {
+        value as i64
+    };
+    reduced as u64
+}
+
 /// Walk `root` in field order and append one [`MetricData`] per metric.
 pub(crate) fn extract_metric_data_from_doc(
     doc_name: &str,
@@ -145,13 +199,10 @@ pub(crate) fn extract_metric_data_from_doc(
     metric_data: &mut Vec<MetricData>,
 ) {
     for (key, value) in root {
-        let path = format!("{doc_name}.{key}");
+        let path = metric_path(doc_name, &key);
         match value {
             Bson::Double(v) => {
-                // Range reduction to int64 is applied in a later change.
-                // `as u64` is not what the compressor stored for NaN,
-                // negatives, or values past 2^63.
-                push_metric(&path, v as u64, value, metric_data);
+                push_metric(&path, double_to_metric(v), value, metric_data);
             }
             Bson::Int32(v) => push_metric(&path, v as u64, value, metric_data),
             Bson::Int64(v) => push_metric(&path, v as u64, value, metric_data),

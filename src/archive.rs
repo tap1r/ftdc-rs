@@ -45,8 +45,8 @@ use crate::errors::FileDecoderError;
 use crate::export::write_metrics_parquet;
 use anyhow::anyhow;
 use bson::{Binary, Bson, Document};
+use indexmap::IndexMap;
 use regex::Regex;
-use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::thread;
 
@@ -256,13 +256,13 @@ impl FTDCFileDecoder {
     pub fn decode_decompressed_data_chunks(
         &self,
         data_chunks: Vec<Vec<u8>>,
-    ) -> Result<HashMap<String, Vec<Option<u64>>>, FileDecoderError> {
+    ) -> Result<IndexMap<String, Vec<Option<u64>>>, FileDecoderError> {
         let mut handles = Vec::with_capacity(data_chunks.len());
         for chunk in data_chunks {
             handles.push(thread::spawn(move || decode_one_chunk(chunk)));
         }
 
-        let mut merged: HashMap<String, Vec<Option<u64>>> = HashMap::new();
+        let mut merged: IndexMap<String, Vec<Option<u64>>> = IndexMap::new();
         // How many samples the chunks already appended account for.
         // A metric that first appears later is null for these rows.
         let mut rows = 0usize;
@@ -283,18 +283,20 @@ impl FTDCFileDecoder {
     ///
     /// # Returns
     ///
-    /// * A hashmap of the metric name and a vector of U64 values.
+    /// * Metric names in the order they were first seen, each with its samples.
+    ///   That is the reference document's field order, then metrics introduced
+    ///   by later chunks.
     pub fn read_and_decode(
         &mut self,
         file_name: &str,
         filter: Option<Regex>,
-    ) -> Result<HashMap<String, Vec<Option<u64>>>, FileDecoderError> {
+    ) -> Result<IndexMap<String, Vec<Option<u64>>>, FileDecoderError> {
         let data_chunks = self.read_and_uncompress(file_name)?;
         let decoded_data = self.decode_decompressed_data_chunks(data_chunks)?;
 
         match filter {
             Some(re) => {
-                let mut matched_data: HashMap<String, Vec<Option<u64>>> = HashMap::new();
+                let mut matched_data: IndexMap<String, Vec<Option<u64>>> = IndexMap::new();
 
                 for (key, value) in decoded_data {
                     if re.is_match(&key) {
@@ -309,7 +311,7 @@ impl FTDCFileDecoder {
 
     /// Build a DataFrame whose columns are the decoded series.
     pub fn metrics_to_dataframe(
-        metrics: HashMap<String, Vec<Option<u64>>>,
+        metrics: IndexMap<String, Vec<Option<u64>>>,
     ) -> Result<polars::prelude::DataFrame, FileDecoderError> {
         crate::export::metrics_to_dataframe(metrics)
     }
