@@ -35,11 +35,6 @@ mod tests {
     use crate::FTDCFileDecoder;
     use indexmap::IndexMap;
 
-    //const TEST_FILE_PATH: &str = "test_data/diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
-
-    const TEST_FILE_PATH: &str =
-        "./test_data/diagnostic.data.8.0.11/metrics.2025-07-23T20-33-08Z-00000";
-
     #[test]
     fn test_file_doesnt_exist() {
         let mut bad_file = FTDCFileDecoder::new();
@@ -52,14 +47,6 @@ mod tests {
                 println!("Got expected error {e:?}");
             }
         }
-    }
-
-    #[test]
-    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
-    fn test_should_read_5_chunks() {
-        let mut parsed_file = FTDCFileDecoder::new();
-        parsed_file.read_file(TEST_FILE_PATH).unwrap();
-        assert_eq!(parsed_file.document_count, 213);
     }
 
     /// A MongoDB 7+ archive starts with metadata, then a type 2 delta,
@@ -117,104 +104,6 @@ mod tests {
         assert!(parsed_file.binary_chunks.is_empty());
 
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
-    fn test_inflate_chunks() {
-        let mut parsed_file = FTDCFileDecoder::new();
-        parsed_file.read_file(TEST_FILE_PATH).unwrap();
-
-        let uncompressed_vec = parsed_file.uncompress_data();
-
-        assert!(uncompressed_vec.is_ok());
-
-        match uncompressed_vec {
-            Ok(uncompressed_vec) => {
-                assert_eq!(uncompressed_vec.len(), parsed_file.binary_chunks.len());
-                assert_eq!(uncompressed_vec.len(), 211);
-            }
-            _ => {
-                assert!(false);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
-    fn get_metric_meta_data() -> () {
-        let mut parsed_file = FTDCFileDecoder::new();
-        parsed_file.read_file(TEST_FILE_PATH).unwrap();
-
-        let uncompressed_vec = parsed_file.uncompress_data();
-
-        assert!(uncompressed_vec.is_ok());
-
-        let all_chunks = uncompressed_vec.unwrap();
-
-        for chunk in &all_chunks {
-            match crate::extract::extract_metric_meta_data(&chunk) {
-                Ok(metrics) => {
-                    println!("{:?}", metrics);
-                }
-                Err(_e) => {
-                    assert!(false);
-                }
-            }
-        }
-
-        assert!(true);
-    }
-
-    #[test]
-    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
-    fn test_metric_deltas() -> () {
-        let mut parsed_file = FTDCFileDecoder::new();
-        parsed_file.read_file(TEST_FILE_PATH).unwrap();
-
-        let uncompressed_vec = parsed_file.uncompress_data();
-
-        assert!(uncompressed_vec.is_ok());
-        let all_chunks = uncompressed_vec.unwrap();
-
-        let mut chunk_number = 0;
-        for chunk in &all_chunks {
-            match crate::extract::extract_metric_meta_data(&chunk) {
-                Ok(mut metrics) => {
-                    match crate::decode::extract_all_metrics_from_buffer(&mut metrics, chunk) {
-                        Ok(metric_count) => {
-                            println!(
-                                "chunk {chunk_number} {metric_count} = {}",
-                                metrics.get(0).unwrap().metrics.unwrap()
-                            );
-                        }
-                        Err(e) => {
-                            println!("Chunk number {chunk_number}\nGot error {e:?}");
-                            assert!(false);
-                        }
-                    }
-                }
-                Err(_e) => {
-                    assert!(false);
-                }
-            }
-            chunk_number += 1;
-        }
-
-        assert!(true);
-    }
-
-    #[test]
-    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
-    fn test_get_metric_data_decoded() -> () {
-        let mut parsed_file = FTDCFileDecoder::new();
-        let data_vec = parsed_file.read_and_decode(TEST_FILE_PATH, None).unwrap();
-
-        data_vec.iter().for_each(|x| {
-            println!("{}", x.0);
-        });
-
-        assert!(true);
     }
 
     /// Encode `n` as the unsigned LEB128 that [`unpack`] reads back.
@@ -801,6 +690,106 @@ mod tests {
             .finish()
             .unwrap();
         assert_eq!(frame.column("n").unwrap().u64().unwrap().get(0), Some(4));
+
+        let _ = std::fs::remove_file(&chunk);
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&parquet);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// The server FTDC README's four-document example, inside a small archive.
+    ///
+    /// The reference is `{a: 1, x: 2}` plus a string and an ObjectId, which
+    /// are not metrics. Three deltas follow. `a` becomes 1, 2, 3, 4 and `x`
+    /// stays 2. Counting the ObjectId would make the walk longer than
+    /// `metric_count` and the decode would fail, or the deltas would land
+    /// on the wrong column. The archive around the chunk is the usual
+    /// prefix: type 0 metadata, then a type 2 delta, then the metric chunk.
+    ///
+    /// This stands in for the `diagnostic.data.8.0.11` files. Those are not
+    /// in the repository, so a test that opens them cannot run.
+    #[test]
+    fn readme_example_round_trips_through_parquet() {
+        let oid = bson::oid::ObjectId::from_bytes([0x33; 12]);
+        let reference = bson::doc! {
+            "a": 1i32,
+            "x": 2i32,
+            "s": "t",
+            "id": oid,
+        };
+        let chunk = write_one_chunk(&reference, 2, 3, &[1, 1, 1, 0, 0, 0]);
+
+        let mut bytes = Vec::new();
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(0),
+            "type": 0i32,
+            "doc": {
+                "host": "a.example",
+                "start": bson::DateTime::from_millis(1_700_000_000_000),
+            }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(1),
+            "type": 2i32,
+            "count": 0i32,
+            "doc": { "param": 7i32 }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+        bytes.extend(std::fs::read(&chunk).unwrap());
+
+        let dir = std::env::temp_dir();
+        let input = dir.join(format!("ftdc-rs-golden-{}.bin", std::process::id()));
+        let parquet = dir.join(format!("ftdc-rs-golden-{}.parquet", std::process::id()));
+        let sidecar = dir.join(format!(
+            "ftdc-rs-golden-{}.metadata.json",
+            std::process::id()
+        ));
+        std::fs::write(&input, bytes).unwrap();
+
+        FTDCFileDecoder::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
+
+        use polars::prelude::SerReader;
+        let mut file = std::fs::File::open(&parquet).unwrap();
+        let frame = polars::prelude::ParquetReader::new(&mut file)
+            .finish()
+            .unwrap();
+        let columns: Vec<String> = frame
+            .get_column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(columns, vec!["a".to_string(), "x".to_string()]);
+        assert_eq!(
+            frame
+                .column("a")
+                .unwrap()
+                .u64()
+                .unwrap()
+                .into_no_null_iter()
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            frame
+                .column("x")
+                .unwrap()
+                .u64()
+                .unwrap()
+                .into_no_null_iter()
+                .collect::<Vec<_>>(),
+            vec![2, 2, 2, 2]
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(json["metadata"][0]["host"], "a.example");
+        assert!(json["metadata"][0]["start"]["$date"].is_string());
+        assert_eq!(json["metadataDeltas"][0]["param"], serde_json::json!(7));
+        assert_eq!(json["documentCount"], serde_json::json!(3));
+        assert_eq!(json["metrics"], serde_json::json!(["a", "x"]));
 
         let _ = std::fs::remove_file(&chunk);
         let _ = std::fs::remove_file(&input);
