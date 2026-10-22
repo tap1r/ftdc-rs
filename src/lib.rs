@@ -65,9 +65,18 @@ pub struct FTDCFileDecoder {
 struct MetricData {
     name: String,
     initial: u64,
+    /// BSON value this sample was taken from. Kept so a metric_count
+    /// mismatch can say which field disagreed with the compressor.
+    #[allow(dead_code)]
     metric_type: Bson,
     metrics: Option<usize>,
-    data: Option<[u64; FTDCFileDecoder::MAX_METRICS]>,
+    /// Reconstructed samples for one chunk.
+    ///
+    /// Index 0 is the value taken from the reference document. Each later
+    /// index is that value plus the deltas that follow it. The length is
+    /// `sample_count + 1`, not `sample_count`: the header counts deltas,
+    /// and the reference document is itself a sample.
+    data: Option<Vec<u64>>,
 }
 
 struct RangeCursor {
@@ -76,52 +85,88 @@ struct RangeCursor {
     at: usize,
 }
 
-/// Unpacks varint deltas
+/// Read one unsigned LEB128 integer from the delta block.
 ///
-/// # Arguments
-///
-/// * `data_range_cursor` - A structure that holds the decompressed deltas.
-fn unpack(data_range_cursor: &mut RangeCursor) -> u64 {
+/// FTDC uses the same 7-bit grouping as the S2 varint: the low 7 bits
+/// are payload, and the high bit says another byte follows. A zero is a
+/// real value (it starts a run of zeros). Running off the end of the
+/// buffer used to return 0 as well, so a short chunk was decoded as a
+/// run of quiet zeros instead of a broken file.
+fn unpack(data_range_cursor: &mut RangeCursor) -> Result<u64, FileDecoderError> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
 
     loop {
-        if data_range_cursor.at >= data_range_cursor._size {
-            break;
+        if data_range_cursor.at >= data_range_cursor.buffer.len() {
+            return Err(FileDecoderError::Other(anyhow!(
+                "FTDC varint ran past the end of the delta block"
+            )));
+        }
+        // A u64 has room for 10 payload bytes (9 * 7 + 1). One more byte
+        // would shift by 70 and panic, and it cannot be a legal value.
+        if shift >= 64 {
+            return Err(FileDecoderError::Other(anyhow!(
+                "FTDC varint is wider than 64 bits"
+            )));
         }
         let b = data_range_cursor.buffer[data_range_cursor.at];
         data_range_cursor.at += 1;
 
-        result |= ((b & 0x07f) as u64) << shift;
-        shift += 7;
+        result |= u64::from(b & 0x7f) << shift;
         if (b & 0x80) == 0 {
-            return result;
+            return Ok(result);
         }
+        shift += 7;
     }
-
-    0
 }
 
 impl FTDCFileDecoder {
-    pub const MAX_METRICS: usize = 300;
-
     pub const INITIAL_METRIC_CAPACITY: usize = 10240;
 
-    /// Reads the info on the header of a decompressed data chunk.
-    /// This is not very reliable for metric_count.
-    fn read_header(data: &[u8]) -> (usize, usize, usize) {
-        //  as *const u32;
-        let data_size = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    /// The server refuses a chunk whose `metric_count * sample_count`
+    /// exceeds this. A corrupt header that asks for more than that is
+    /// rejected here so we do not allocate it.
+    const MAX_METRIC_SAMPLES: usize = 1_000_000;
 
-        let offset: usize = data_size as usize;
-        let metric_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-        let delta_count = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
-
-        (
-            data_size as usize,
-            metric_count as usize,
-            delta_count as usize,
-        )
+    /// Read the three words that precede the delta block.
+    ///
+    /// Layout of an inflated metric chunk, after the 4-byte uncompressed
+    /// size and the zlib wrapper have been removed:
+    ///
+    /// ```text
+    /// reference document   BSON, whose own first 4 bytes are its length
+    /// metric_count         uint32   how many numbers were extracted
+    /// sample_count         uint32   how many *deltas* follow, per metric
+    /// deltas               varints
+    /// ```
+    ///
+    /// `sample_count` does not include the reference document. The server
+    /// decompressor returns `1 + sample_count` samples: the reference,
+    /// then one reconstructed document per delta. A chunk that only holds
+    /// the reference (common at the start of a file) has `sample_count`
+    /// 0 and still has one sample.
+    fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDecoderError> {
+        if data.len() < 4 {
+            return Err(FileDecoderError::Other(anyhow!(
+                "inflated metric chunk is shorter than a BSON length"
+            )));
+        }
+        let data_size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        if data_size < 5 || data.len() < data_size.saturating_add(8) {
+            return Err(FileDecoderError::Other(anyhow!(
+                "inflated metric chunk does not contain metric_count and sample_count"
+            )));
+        }
+        let metric_count =
+            u32::from_le_bytes(data[data_size..data_size + 4].try_into().unwrap()) as usize;
+        let sample_count =
+            u32::from_le_bytes(data[data_size + 4..data_size + 8].try_into().unwrap()) as usize;
+        if metric_count.saturating_mul(sample_count) > Self::MAX_METRIC_SAMPLES {
+            return Err(FileDecoderError::Other(anyhow!(
+                "metric_count {metric_count} and sample_count {sample_count} exceed the FTDC limit"
+            )));
+        }
+        Ok((data_size, metric_count, sample_count))
     }
 
     /// Inflates/uncompressed a zipped blob.
@@ -343,71 +388,79 @@ impl FTDCFileDecoder {
         }
     }
 
-    /// Extract metric values from decompressed Metric data as varint deltas added to an initial value.
+    /// Rebuild every metric in one inflated chunk.
     ///
-    /// # Arguments
+    /// The delta block is column-major: every delta of metric 0, then
+    /// every delta of metric 1, and so on. A delta is added to the
+    /// previous sample with wrapping `uint64` arithmetic, which is what
+    /// the C++ compressor does (`uint64_t` addition). The reference
+    /// value is sample 0 and is not itself stored as a delta.
     ///
-    /// * - `metric_data_vec` -  A vector of MetricData where the uncompressed data is.
+    /// Zeros are run-length encoded across that whole block, including
+    /// across the boundary between two metrics. A run of *k* zeros is
+    /// stored as the pair `[0, k - 1]`: the `0` is the first zero, and
+    /// the next varint is how many further zeros follow. The count is
+    /// shared across metrics on purpose. Resetting it at each metric
+    /// would swallow the run that the compressor wrote as one pair.
     ///
-    /// # Returns
-    ///
-    ///  A count of how many values were found. The actual values are stored in the `metric_data_vec`
-    fn extract_all_metrics_from_buffer<'a>(
+    /// The returned count is the number of reconstructed sample values
+    /// (`metrics * (sample_count + 1)`). Each `MetricData::data` vector
+    /// has length `sample_count + 1`.
+    fn extract_all_metrics_from_buffer(
         metric_data_vec: &mut Vec<MetricData>,
         buffer: &Vec<u8>,
     ) -> Result<usize, FileDecoderError> {
-        let (doc_size, _, delta_count_from_header) =
-            FTDCFileDecoder::read_header(buffer.as_slice());
+        let (doc_size, _metric_count, delta_count) =
+            FTDCFileDecoder::read_header(buffer.as_slice())?;
 
         let offset = doc_size + 8;
-        let data_range_size = buffer.len() - offset;
-
-        let q = buffer.as_slice()[offset..].to_vec();
+        if offset > buffer.len() {
+            return Err(FileDecoderError::Other(anyhow!(
+                "metric chunk header points past the end of the inflated buffer"
+            )));
+        }
         let mut data_range_cursor = RangeCursor {
-            buffer: q,
-            _size: data_range_size,
+            buffer: buffer[offset..].to_vec(),
+            _size: buffer.len() - offset,
             at: 0,
         };
 
         let mut count = 0;
-        let mut num_zeroes: u32 = 0;
-        for m in 0..metric_data_vec.len() {
-            let mut unpacked_value = metric_data_vec.get(m).unwrap().initial;
+        // Additional zeros still to emit. This survives from one metric
+        // to the next. See the comment on this function.
+        let mut zeros_remaining: u64 = 0;
+        for metric in metric_data_vec.iter_mut() {
+            let mut value = metric.initial;
+            let mut samples = Vec::with_capacity(delta_count + 1);
+            samples.push(value);
 
-            let _name = &metric_data_vec.get(m).unwrap().name;
-            let _type = &metric_data_vec.get(m).unwrap().metric_type;
-            //println!("{m}: name = {_name}  type ={_type:?}");
+            for _ in 0..delta_count {
+                let delta = if zeros_remaining != 0 {
+                    zeros_remaining -= 1;
+                    0
+                } else {
+                    let decoded = unpack(&mut data_range_cursor)?;
+                    if decoded == 0 {
+                        zeros_remaining = unpack(&mut data_range_cursor)?;
+                    }
+                    decoded
+                };
 
-            let mut metric_values = [0u64; FTDCFileDecoder::MAX_METRICS];
-            metric_values[0] = unpacked_value;
-            for s in 1..FTDCFileDecoder::MAX_METRICS {
-                metric_values[s] = 0;
+                // Wrapping add. A delta of u64::MAX takes a counter
+                // backwards by one, which is how a value that decreased
+                // is encoded. Checked add would fail those samples.
+                value = value.wrapping_add(delta);
+                samples.push(value);
+                count += 1;
             }
 
-            for s in 0..delta_count_from_header {
-                let delta: u64;
-                if num_zeroes != 0 {
-                    delta = 0;
-                    num_zeroes -= 1;
-                } else {
-                    delta = unpack(&mut data_range_cursor);
-                    if delta == 0 {
-                        num_zeroes = unpack(&mut data_range_cursor) as u32;
-                    }
-                }
-
-                // Handling overflow on the cheap. The following line works in C++
-                // unpacked_value += delta;
-                // when  112 + 18446744073709551615
-                unpacked_value = (u128::from(unpacked_value) + u128::from(delta)) as u64;
-                // But Rust is aware of overflow.
-                metric_values[s + 1] = unpacked_value;
-
-                count += 1;
-            } //
-
-            metric_data_vec.get_mut(m).unwrap().data = Option::from(metric_values);
-            metric_data_vec.get_mut(m).unwrap().metrics = Option::from(delta_count_from_header);
+            // Length includes the reference sample. Callers that kept
+            // only `delta_count` elements dropped the last sample of
+            // every chunk, and dropped the only sample of a chunk whose
+            // sample_count was 0.
+            metric.metrics = Some(samples.len());
+            metric.data = Some(samples);
+            count += 1;
         }
 
         Ok(count)
@@ -562,27 +615,25 @@ impl FTDCFileDecoder {
                     )?;
 
                     for metric in metric_data {
-                        if let Some(old_slice) = metric.data
-                            && let Some(used_metrics) = metric.metrics
-                        {
-                            // remove first char, which is a dot.
+                        if let Some(mut samples) = metric.data {
+                            // `samples` already has the reference value and
+                            // every reconstructed delta. Append the whole
+                            // vector. Slicing it down to the header's
+                            // sample_count drops the last point.
                             let name = String::from(metric.name).split_off(1);
 
                             let mut out = mdh.lock().unwrap();
                             if out.contains_key(&name) {
                                 if let Some(metric_member_data) = out.get_mut(&name) {
-                                    // add slice to vector
-                                    metric_member_data
-                                        .append(&mut old_slice[0..used_metrics].to_vec());
+                                    metric_member_data.append(&mut samples);
                                 } else {
                                     return Err(FileDecoderError::Other(anyhow!(
                                         "Could not find metric name '{name}'"
                                     )));
                                 }
                             } else {
-                                // insert new
                                 let mut vec = Vec::with_capacity(Self::INITIAL_METRIC_CAPACITY);
-                                vec.append(&mut old_slice[0..used_metrics].to_vec());
+                                vec.append(&mut samples);
                                 out.insert(name, vec);
                             }
                         } else {
@@ -998,6 +1049,144 @@ mod tests {
         });
 
         assert!(true);
+    }
+
+    /// Encode `n` as the unsigned LEB128 that [`unpack`] reads back.
+    fn encode_varint(mut n: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Encode a column-major delta list the way the compressor does.
+    ///
+    /// A run of *k* zeros becomes the two varints `[0, k - 1]`. The
+    /// first 0 is a zero delta. The second number is how many more
+    /// zeros follow it, not how many zeros there were in total.
+    fn encode_deltas(deltas: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < deltas.len() {
+            if deltas[index] != 0 {
+                out.extend(encode_varint(deltas[index]));
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < deltas.len() && deltas[index] == 0 {
+                index += 1;
+            }
+            let run = (index - start) as u64;
+            out.extend(encode_varint(0));
+            out.extend(encode_varint(run - 1));
+        }
+        out
+    }
+
+    /// Build a one-chunk FTDC file and return its path.
+    ///
+    /// `sample_count` is the header value: the number of deltas per
+    /// metric, not the number of samples. `deltas` is column-major,
+    /// metric 0's deltas first.
+    fn write_one_chunk(
+        reference: &bson::Document,
+        metric_count: u32,
+        sample_count: u32,
+        deltas: &[u64],
+    ) -> std::path::PathBuf {
+        use std::io::Write;
+
+        let mut payload = Vec::new();
+        reference.to_writer(&mut payload).unwrap();
+        payload.extend_from_slice(&metric_count.to_le_bytes());
+        payload.extend_from_slice(&sample_count.to_le_bytes());
+        payload.extend(encode_deltas(deltas));
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut blob = Vec::with_capacity(4 + compressed.len());
+        blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        blob.extend(compressed);
+
+        let wrapper = bson::doc! {
+            "_id": bson::DateTime::from_millis(0),
+            "type": 1i32,
+            "data": bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: blob,
+            }
+        };
+        let mut file = Vec::new();
+        wrapper.to_writer(&mut file).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "ftdc-rs-chunk-{}-{sample_count}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, file).unwrap();
+        path
+    }
+
+    /// The walkthrough in the server FTDC README, plus the two edges the
+    /// fixed `[u64; 300]` buffer got wrong.
+    ///
+    /// Four documents `{a, x, s}` become a reference of `{a:1, x:2}`
+    /// (the string is not a metric) and the delta block `[1, 1, 1, 0, 2]`.
+    /// The reconstructed series have four points, not three. A chunk
+    /// with `sample_count == 0` still yields the reference. A chunk with
+    /// 300 deltas used to write `metric_values[300]` and panic.
+    #[test]
+    fn reference_sample_is_kept_and_a_full_chunk_does_not_panic() {
+        let reference = bson::doc! { "a": 1i32, "x": 2i32, "s": "t" };
+        // a grows 1,2,3,4. x stays 2. Three zeros encode as [0, 2].
+        let path = write_one_chunk(&reference, 2, 3, &[1, 1, 1, 0, 0, 0]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            series.get("a").map(Vec::as_slice),
+            Some([1, 2, 3, 4].as_slice())
+        );
+        assert_eq!(
+            series.get("x").map(Vec::as_slice),
+            Some([2, 2, 2, 2].as_slice())
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let reference_only = write_one_chunk(&reference, 2, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(reference_only.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(series.get("a").map(Vec::as_slice), Some([1].as_slice()));
+        assert_eq!(series.get("x").map(Vec::as_slice), Some([2].as_slice()));
+        let _ = std::fs::remove_file(&reference_only);
+
+        let wide = bson::doc! { "n": 0i64 };
+        let path = write_one_chunk(&wide, 1, 300, &vec![1u64; 300]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        let values = series.get("n").expect("metric n");
+        assert_eq!(values.len(), 301);
+        assert_eq!(values[0], 0);
+        assert_eq!(values[300], 300);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
