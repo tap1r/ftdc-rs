@@ -33,7 +33,7 @@ pub(crate) use extract::decimal_text_to_i64;
 
 mod tests {
     use crate::FTDCFileDecoder;
-    use std::collections::HashMap;
+    use indexmap::IndexMap;
 
     //const TEST_FILE_PATH: &str = "test_data/diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
 
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_to_dataframe() {
-        let mut test_metrics: HashMap<String, Vec<Option<u64>>> = HashMap::new();
+        let mut test_metrics: IndexMap<String, Vec<Option<u64>>> = IndexMap::new();
         test_metrics.insert(
             "metric1".to_string(),
             vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
@@ -545,6 +545,20 @@ mod tests {
         let df = FTDCFileDecoder::metrics_to_dataframe(test_metrics).unwrap();
         assert_eq!(df.width(), 3);
         assert_eq!(df.height(), 5);
+        // Insertion order is the column order. metric1 was inserted first.
+        let column_names: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            column_names,
+            vec![
+                "metric1".to_string(),
+                "metric2".to_string(),
+                "metric3".to_string()
+            ]
+        );
 
         let metric1_col = df.column("metric1").unwrap();
         let metric2_col = df.column("metric2").unwrap();
@@ -555,7 +569,7 @@ mod tests {
         assert_eq!(metric3_col.u64().unwrap().get(3), None);
         assert_eq!(metric3_col.u64().unwrap().get(4), None);
 
-        let mut ragged = HashMap::new();
+        let mut ragged = IndexMap::new();
         ragged.insert("a".to_string(), vec![Some(1u64), Some(2)]);
         ragged.insert("b".to_string(), vec![Some(3u64)]);
         assert!(FTDCFileDecoder::metrics_to_dataframe(ragged).is_err());
@@ -595,5 +609,129 @@ mod tests {
         let err = parsed.read_file(cut.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("middle"), "{err}");
         let _ = std::fs::remove_file(&cut);
+    }
+
+    /// Doubles are reduced to int64 and then stored as that bit pattern.
+    /// Column order is the reference document's field order. A metric that
+    /// shows up in a later chunk is appended after the names already seen,
+    /// including when its name sorts earlier.
+    #[test]
+    fn doubles_follow_int64_range_rules_and_columns_keep_field_order() {
+        assert_eq!(crate::extract::double_to_metric(f64::NAN), 0);
+        assert_eq!(
+            crate::extract::double_to_metric(f64::INFINITY),
+            i64::MAX as u64
+        );
+        assert_eq!(
+            crate::extract::double_to_metric(f64::NEG_INFINITY),
+            i64::MIN as u64
+        );
+        assert_eq!(crate::extract::double_to_metric(1.9), 1);
+        assert_eq!(crate::extract::double_to_metric(-1.9), (-1i64) as u64);
+        assert_eq!(crate::extract::double_to_metric(-0.4), 0);
+
+        // 2^63 is BSONElement::kLongLongMaxPlusOneAsDouble. The f64 just
+        // below it is in range and is kept. 2^63 itself saturates.
+        let two_63 = (1u64 << 63) as f64;
+        assert_eq!(crate::extract::double_to_metric(two_63), i64::MAX as u64);
+        let just_below = f64::from_bits(two_63.to_bits() - 1);
+        assert!(just_below < two_63);
+        assert_eq!(
+            crate::extract::double_to_metric(just_below),
+            just_below as u64
+        );
+        assert_eq!(crate::extract::double_to_metric(1e20), i64::MAX as u64);
+        assert_eq!(crate::extract::double_to_metric(-1e20), i64::MIN as u64);
+
+        // Field order is z, neg, nested.m, ts_time, ts_increment, wide.
+        // Alphabetical order would put neg first. The nested name has no
+        // leading dot. The timestamp is two columns, seconds then increment.
+        let mut reference = bson::doc! {
+            "z": 1.9,
+            "neg": -1.9,
+            "nested": { "m": 3i32 },
+            "ts": bson::Timestamp { time: 5, increment: 7 },
+        };
+        reference.insert("wide", f64::INFINITY);
+        let path = write_one_chunk(&reference, 6, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        let names: Vec<&str> = series.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["z", "neg", "nested.m", "ts_time", "ts_increment", "wide"]
+        );
+        assert_eq!(
+            series.get("z").map(Vec::as_slice),
+            Some([Some(1)].as_slice())
+        );
+        assert_eq!(
+            series.get("neg").map(Vec::as_slice),
+            Some([Some((-1i64) as u64)].as_slice())
+        );
+        assert_eq!(
+            series.get("nested.m").map(Vec::as_slice),
+            Some([Some(3)].as_slice())
+        );
+        assert_eq!(
+            series.get("ts_time").map(Vec::as_slice),
+            Some([Some(5)].as_slice())
+        );
+        assert_eq!(
+            series.get("ts_increment").map(Vec::as_slice),
+            Some([Some(7)].as_slice())
+        );
+        assert_eq!(
+            series.get("wide").map(Vec::as_slice),
+            Some([Some(i64::MAX as u64)].as_slice())
+        );
+
+        let df = FTDCFileDecoder::metrics_to_dataframe(series).unwrap();
+        let columns: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            columns,
+            vec![
+                "z".to_string(),
+                "neg".to_string(),
+                "nested.m".to_string(),
+                "ts_time".to_string(),
+                "ts_increment".to_string(),
+                "wide".to_string()
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // `m` sorts before `z`, and it is new in the second chunk, so it
+        // is appended. It does not jump ahead of `z` and `a`.
+        let first = write_one_chunk(&bson::doc! { "z": 1i32, "a": 2i32 }, 2, 0, &[]);
+        let second = write_one_chunk(&bson::doc! { "m": 3i32, "z": 4i32 }, 2, 0, &[]);
+        let mut bytes = std::fs::read(&first).unwrap();
+        bytes.extend(std::fs::read(&second).unwrap());
+        let ordered =
+            std::env::temp_dir().join(format!("ftdc-rs-order-cols-{}.bin", std::process::id()));
+        std::fs::write(&ordered, bytes).unwrap();
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(ordered.to_str().unwrap(), None)
+            .unwrap();
+        let names: Vec<&str> = series.keys().map(String::as_str).collect();
+        assert_eq!(names, ["z", "a", "m"]);
+        assert_eq!(
+            series.get("a").map(Vec::as_slice),
+            Some([Some(2), None].as_slice())
+        );
+        assert_eq!(
+            series.get("m").map(Vec::as_slice),
+            Some([None, Some(3)].as_slice())
+        );
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+        let _ = std::fs::remove_file(&ordered);
     }
 }
