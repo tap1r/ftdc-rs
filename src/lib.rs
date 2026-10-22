@@ -9,10 +9,8 @@ use buffered_reader::BufferedReader;
 use polars::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use zune_inflate::DeflateDecoder;
-use zune_inflate::errors::{DecodeErrorStatus, InflateDecodeErrors};
 
 /// `type` values on the BSON documents concatenated inside an FTDC archive.
 ///
@@ -118,6 +116,53 @@ fn unpack(data_range_cursor: &mut RangeCursor) -> Result<u64, FileDecoderError> 
         }
         shift += 7;
     }
+}
+
+/// Inflate one metric blob.
+///
+/// The first four bytes are the uncompressed size the server writes in
+/// front of the zlib stream (`metrics_chunk.uncompressed_size`). They
+/// are not zlib bytes. A blob shorter than that is not a metric chunk.
+fn inflate_owned(bytes: Vec<u8>) -> Result<Vec<u8>, FileDecoderError> {
+    if bytes.len() < 4 {
+        return Err(FileDecoderError::Other(anyhow!(
+            "metric blob is shorter than the 4-byte uncompressed size"
+        )));
+    }
+    let mut decoder = DeflateDecoder::new(&bytes[4..]);
+    match decoder.decode_zlib() {
+        Ok(encoded_data) => Ok(encoded_data),
+        Err(error) => Err(FileDecoderError::Other(anyhow!(
+            "zlib inflate of an FTDC metric chunk failed: {error}"
+        ))),
+    }
+}
+
+/// Reconstruct one inflated chunk as `(name, samples)` pairs, in walk order.
+///
+/// The name still has its leading dot stripped here. Publishing the path
+/// without that dot is a separate change. This function does not append
+/// to a shared map: the caller appends, in chunk order.
+fn decode_one_chunk(chunk: Vec<u8>) -> Result<Vec<(String, Vec<u64>)>, FileDecoderError> {
+    let mut metric_data = FTDCFileDecoder::extract_metric_meta_data(&chunk)?;
+    FTDCFileDecoder::extract_all_metrics_from_buffer(&mut metric_data, &chunk)?;
+
+    let mut columns = Vec::with_capacity(metric_data.len());
+    for metric in metric_data {
+        let Some(samples) = metric.data else {
+            return Err(FileDecoderError::Other(anyhow!(
+                "metric '{}' produced no samples",
+                metric.name
+            )));
+        };
+        let mut name = metric.name;
+        // The walk prefixes every segment with a dot, including the first.
+        if name.starts_with('.') {
+            name.remove(0);
+        }
+        columns.push((name, samples));
+    }
+    Ok(columns)
 }
 
 fn push_metric(name: &str, initial: u64, metric_type: Bson, out: &mut Vec<MetricData>) {
@@ -260,67 +305,34 @@ impl FTDCFileDecoder {
         Ok((data_size, metric_count, sample_count))
     }
 
-    /// Inflates/uncompressed a zipped blob.
+    /// Inflate every metric chunk, and return the chunks in file order.
     ///
-    /// # Arguments
-    /// * `blob` - A binary BSON document.
+    /// Inflation has no cross-chunk dependency, so each blob runs on its
+    /// own thread. The output does. Sample 0 of chunk N+1 is the sample
+    /// after the last sample of chunk N. Pushing into a shared `Vec`
+    /// from whichever thread took the lock first scrambled that order,
+    /// and it scrambled it differently on every run.
     ///
-    /// # Returns
-    /// A vector of u8 values representing the decompressed blob.
-    ///
-    fn inflate_blob(blob: &Binary) -> Result<Vec<u8>, InflateDecodeErrors> {
-        // Get blob
-        let compressed_buffer = blob.bytes.as_slice();
-        // Compressed buffer. Ignore first 4 bytes.
-        let mut decoder = DeflateDecoder::new(&compressed_buffer[4..]);
-
-        // Uncompressed data has metrics_count and delta_count in the header,
-        // as u32.
-        match decoder.decode_zlib() {
-            Ok(encoded_data) => Ok(encoded_data),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Uncompresses all binary blobs - threaded uncompression
-    ///
-    /// # Arguments
-    ///
-    /// # Returns
-    /// * A vector of vectors of u8, representing the uncompressed deltas block.
-    pub fn uncompress_data(&self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
-        let uncompressed_data_vector = Arc::new(Mutex::new(vec![]));
-        let binary_chunks_x = Arc::new(self.binary_chunks.clone());
-
-        let mut handles = vec![];
-
-        for i in 0..binary_chunks_x.len() {
-            let udv = Arc::clone(&uncompressed_data_vector);
-            let bc = Arc::clone(&binary_chunks_x);
-
-            let handle = thread::spawn(move || -> Result<i32, InflateDecodeErrors> {
-                if let Some(binary_chunk) = bc.get(i) {
-                    let inflated_data: Vec<u8> = FTDCFileDecoder::inflate_blob(binary_chunk)?;
-
-                    let mut uncompressed_data_vector = udv.lock().unwrap();
-                    uncompressed_data_vector.push(inflated_data);
-                } else {
-                    return Err(InflateDecodeErrors::new(
-                        DecodeErrorStatus::InsufficientData,
-                        vec![],
-                    ));
-                }
-
-                Ok(0)
-            });
-            handles.push(handle);
+    /// The handles are joined in the order they were spawned. A later
+    /// chunk finishing first just waits its turn. The `Result` from the
+    /// worker is returned; it used to be discarded with `let _ =`, so a
+    /// chunk that failed to inflate disappeared and the file still
+    /// looked successful.
+    pub fn uncompress_data(&self) -> Result<Vec<Vec<u8>>, FileDecoderError> {
+        let mut handles = Vec::with_capacity(self.binary_chunks.len());
+        for blob in &self.binary_chunks {
+            let bytes = blob.bytes.clone();
+            handles.push(thread::spawn(move || inflate_owned(bytes)));
         }
 
+        let mut inflated = Vec::with_capacity(handles.len());
         for handle in handles {
-            let _ = handle.join().unwrap();
+            let chunk = handle
+                .join()
+                .map_err(|_| FileDecoderError::Other(anyhow!("FTDC inflate thread panicked")))??;
+            inflated.push(chunk);
         }
-
-        Ok(uncompressed_data_vector.lock().unwrap().clone())
+        Ok(inflated)
     }
 
     /// Walk a reference document in field order and record one metric per
@@ -646,10 +658,7 @@ impl FTDCFileDecoder {
         file_name: &str,
     ) -> Result<Vec<Vec<u8>>, FileDecoderError> {
         match self.read_file(file_name) {
-            Ok(_) => match self.uncompress_data() {
-                Ok(uncompressed_vec) => Ok(uncompressed_vec),
-                Err(e) => Err(FileDecoderError::Other(anyhow!(e))),
-            },
+            Ok(_) => self.uncompress_data(),
             Err(e) => {
                 println!("Got expected error {e:?}");
                 Err(e)
@@ -657,82 +666,43 @@ impl FTDCFileDecoder {
         }
     }
 
-    /// Decodes data in chunks that have been decompressed. Processing for each chunk is done
-    /// in a separate thread.
+    /// Decode inflated chunks and append each metric in file order.
     ///
-    /// # Arguments
+    /// Each chunk is decoded on its own thread, because the reference
+    /// walk and the delta reconstruction do not look at other chunks.
+    /// The append does. A metric's samples are the concatenation of its
+    /// samples from chunk 0, then chunk 1, then chunk 2. Joining the
+    /// workers in spawn order and appending only after the previous
+    /// chunk has been appended is what keeps that concatenation in time
+    /// order. Appending from inside the worker, under a mutex, appended
+    /// in completion order instead.
     ///
-    /// * `data_chunks` - A vector of pre-decompressed chunks
-    ///
-    /// # Returns
-    /// * A hashmap with metric names as String, and a vector of U64 values.
-    ///
+    /// A worker's `Err` stops the decode. Previously the `Result` was
+    /// ignored, so a chunk whose `metric_count` did not match the
+    /// reference walk was dropped and the rest of the file was returned
+    /// as success.
     pub fn decode_decompressed_data_chunks(
         &self,
         data_chunks: Vec<Vec<u8>>,
     ) -> Result<HashMap<String, Vec<u64>>, FileDecoderError> {
-        let metric_data: HashMap<String, Vec<u64>> = HashMap::new();
-        let metric_data_arc = Arc::new(Mutex::new(metric_data));
-        let data_chunks_arc = Arc::new(data_chunks);
-
-        let mut handles = vec![];
-
-        for i in 0..data_chunks_arc.len() {
-            let mdh = Arc::clone(&metric_data_arc);
-            let dc = Arc::clone(&data_chunks_arc);
-
-            let handle = thread::spawn(move || -> Result<i32, FileDecoderError> {
-                if let Some(data_chunk) = dc.get(i) {
-                    let mut metric_data = FTDCFileDecoder::extract_metric_meta_data(&data_chunk)?;
-                    let _metric_data_size = FTDCFileDecoder::extract_all_metrics_from_buffer(
-                        &mut metric_data,
-                        &data_chunk,
-                    )?;
-
-                    for metric in metric_data {
-                        if let Some(mut samples) = metric.data {
-                            // `samples` already has the reference value and
-                            // every reconstructed delta. Append the whole
-                            // vector. Slicing it down to the header's
-                            // sample_count drops the last point.
-                            let name = String::from(metric.name).split_off(1);
-
-                            let mut out = mdh.lock().unwrap();
-                            if out.contains_key(&name) {
-                                if let Some(metric_member_data) = out.get_mut(&name) {
-                                    metric_member_data.append(&mut samples);
-                                } else {
-                                    return Err(FileDecoderError::Other(anyhow!(
-                                        "Could not find metric name '{name}'"
-                                    )));
-                                }
-                            } else {
-                                let mut vec = Vec::with_capacity(Self::INITIAL_METRIC_CAPACITY);
-                                vec.append(&mut samples);
-                                out.insert(name, vec);
-                            }
-                        } else {
-                            return Err(FileDecoderError::Other(anyhow!(
-                                "Could not find valid data in metrics: {metric:?}"
-                            )));
-                        }
-                    }
-                } else {
-                    return Err(FileDecoderError::Other(anyhow!(
-                        "Could not find data in metrics"
-                    )));
-                }
-
-                Ok(0)
-            });
-            handles.push(handle);
+        let mut handles = Vec::with_capacity(data_chunks.len());
+        for chunk in data_chunks {
+            handles.push(thread::spawn(move || decode_one_chunk(chunk)));
         }
 
+        let mut merged: HashMap<String, Vec<u64>> = HashMap::new();
         for handle in handles {
-            let _ = handle.join().unwrap();
+            let metrics = handle
+                .join()
+                .map_err(|_| FileDecoderError::Other(anyhow!("FTDC decode thread panicked")))??;
+            for (name, mut samples) in metrics {
+                merged
+                    .entry(name)
+                    .or_insert_with(|| Vec::with_capacity(Self::INITIAL_METRIC_CAPACITY))
+                    .append(&mut samples);
+            }
         }
-
-        Ok(metric_data_arc.lock().unwrap().clone())
+        Ok(merged)
     }
 
     /// Reads an FTDC file, uncompresses binary docs contained in it and decodes deltas.
@@ -1345,6 +1315,43 @@ mod tests {
         assert_eq!(super::decimal_text_to_i64("NaN"), 0);
         assert_eq!(super::decimal_text_to_i64("Infinity"), i64::MAX);
         assert_eq!(super::decimal_text_to_i64("-Infinity"), i64::MIN);
+    }
+
+    /// Two chunks must concatenate in file order, and a chunk whose
+    /// metric_count does not match the walk must fail the whole decode.
+    /// Both used to be swallowed: workers appended under a mutex, and
+    /// the worker's Result was discarded.
+    #[test]
+    fn chunks_stay_in_file_order_and_errors_are_returned() {
+        let first = write_one_chunk(&bson::doc! { "n": 10i32 }, 1, 0, &[]);
+        let second = write_one_chunk(&bson::doc! { "n": 20i32 }, 1, 0, &[]);
+        let mut bytes = std::fs::read(&first).unwrap();
+        bytes.extend(std::fs::read(&second).unwrap());
+        let path = std::env::temp_dir().join(format!("ftdc-rs-order-{}.bin", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            series.get("n").map(Vec::as_slice),
+            Some([10, 20].as_slice()),
+            "chunk 0's sample has to come before chunk 1's"
+        );
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+        let _ = std::fs::remove_file(&path);
+
+        let oid = bson::oid::ObjectId::from_bytes([0x22; 12]);
+        let reference = bson::doc! { "id": oid, "n": 1i32 };
+        let path = write_one_chunk(&reference, 2, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        let err = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .expect_err("metric_count mismatch must fail read_and_decode");
+        assert!(err.to_string().contains("2"), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
