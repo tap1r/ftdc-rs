@@ -1,5 +1,5 @@
 use clap::Parser;
-use ftdc_rs::FTDCFileDecoder;
+use ftdc_rs::Archive;
 use regex::Regex;
 use std::fs;
 use std::io;
@@ -32,8 +32,9 @@ struct Args {
 
     /// Also write `<name>.metadata.json` next to each Parquet file.
     ///
-    /// The sidecar is relaxed extended JSON: every type 0 metadata
-    /// document and every type 2 metadata delta, in file order.
+    /// The sidecar is relaxed extended JSON: every type 0 wrapper
+    /// (`_id` and `doc`) and every type 2 wrapper (`_id`, `count`, and
+    /// `doc`), in file order.
     #[arg(short, long)]
     metadata: bool,
 
@@ -160,12 +161,7 @@ fn main() -> ExitCode {
             out_file.display()
         );
 
-        match FTDCFileDecoder::write_to_parquet(
-            file_name,
-            &out_file,
-            metadata.as_deref(),
-            filter.clone(),
-        ) {
+        match Archive::write_to_parquet(file_name, &out_file, metadata.as_deref(), filter.clone()) {
             Ok(()) => println!("Successfully written to {}", out_file.display()),
             Err(error) => {
                 log::error!("failed to write {}: {error}", out_file.display());
