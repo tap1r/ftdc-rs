@@ -11,20 +11,19 @@
 
 use crate::errors::FileDecoderError;
 
-pub(crate) struct RangeCursor {
-    buffer: Vec<u8>,
-    _size: usize,
+/// A read position in a delta block.
+///
+/// The block is the tail of the inflated chunk, after the reference
+/// document and the two header words. The cursor borrows that tail. An
+/// owned copy used to be taken here and then thrown away with the chunk.
+pub(crate) struct RangeCursor<'a> {
+    buffer: &'a [u8],
     at: usize,
 }
 
-impl RangeCursor {
-    pub(crate) fn new(buffer: Vec<u8>) -> Self {
-        let _size = buffer.len();
-        Self {
-            buffer,
-            _size,
-            at: 0,
-        }
+impl<'a> RangeCursor<'a> {
+    pub(crate) fn new(buffer: &'a [u8]) -> Self {
+        Self { buffer, at: 0 }
     }
 
     pub(crate) fn remaining(&self) -> usize {

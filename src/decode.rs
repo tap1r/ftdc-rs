@@ -60,7 +60,6 @@ use crate::errors::FileDecoderError;
 use crate::extract::{MetricColumn, MetricData, MetricKind};
 use crate::varint::{RangeCursor, unpack};
 use indexmap::IndexMap;
-use std::collections::HashSet;
 use zune_inflate::{DeflateDecoder, DeflateOptions};
 
 /// The server refuses a chunk whose `metric_count * sample_count` exceeds this.
@@ -177,7 +176,7 @@ pub(crate) fn extract_all_metrics_from_buffer(
             "metric chunk header points past the end of the inflated buffer"
         )));
     }
-    let mut data_range_cursor = RangeCursor::new(buffer[offset..].to_vec());
+    let mut data_range_cursor = RangeCursor::new(&buffer[offset..]);
 
     // Additional zeros still to emit. This survives from one metric
     // to the next. See the module docs for the `[0, k - 1]` pair.
@@ -221,7 +220,6 @@ pub(crate) fn extract_all_metrics_from_buffer(
         // sample_count was 0. A filtered-out metric is still walked,
         // so its deltas are consumed, and then discarded.
         if store {
-            metric.metrics = Some(samples.len());
             metric.data = Some(samples);
         }
     }
@@ -299,7 +297,10 @@ pub(crate) fn append_chunk(
     columns: Vec<(String, MetricKind, Vec<u64>)>,
     height: usize,
 ) -> Result<(), FileDecoderError> {
-    let mut present = HashSet::with_capacity(columns.len());
+    // Indices of columns that already existed. A new name is appended, so
+    // it is past this length and already has its leading nulls. Remembering
+    // the index avoids cloning the name into a side set.
+    let mut seen = vec![false; merged.len()];
 
     for (name, kind, samples) in columns {
         if samples.len() != height {
@@ -308,35 +309,33 @@ pub(crate) fn append_chunk(
                 samples.len()
             )));
         }
-        present.insert(name.clone());
-        match merged.get_mut(&name) {
-            Some(existing) => {
-                // The kind is fixed by the chunk that introduced the name.
-                // A later chunk that walks the same path as a different BSON
-                // type would make the sidecar describe every row as the first
-                // kind. The samples are still u64 either way; the mismatch
-                // means the reference documents disagree about the field.
-                if existing.kind != kind {
-                    return Err(FileDecoderError::format(format!(
-                        "metric '{name}' is {} in an earlier chunk and {} in this chunk",
-                        existing.kind.as_str(),
-                        kind.as_str()
-                    )));
-                }
-                existing.values.extend(samples.into_iter().map(Some));
+        if let Some(index) = merged.get_index_of(&name) {
+            let (_, existing) = merged.get_index_mut(index).expect("index just found");
+            // The kind is fixed by the chunk that introduced the name.
+            // A later chunk that walks the same path as a different BSON
+            // type would make the sidecar describe every row as the first
+            // kind. The samples are still u64 either way; the mismatch
+            // means the reference documents disagree about the field.
+            if existing.kind != kind {
+                return Err(FileDecoderError::format(format!(
+                    "metric '{name}' is {} in an earlier chunk and {} in this chunk",
+                    existing.kind.as_str(),
+                    kind.as_str()
+                )));
             }
-            None => {
-                let mut values = Vec::with_capacity(*rows + height);
-                values.resize(*rows, None);
-                values.extend(samples.into_iter().map(Some));
-                merged.insert(name, MetricColumn { kind, values });
-            }
+            existing.values.extend(samples.into_iter().map(Some));
+            seen[index] = true;
+        } else {
+            let mut values = Vec::with_capacity(*rows + height);
+            values.resize(*rows, None);
+            values.extend(samples.into_iter().map(Some));
+            merged.insert(name, MetricColumn { kind, values });
         }
     }
 
     let end = *rows + height;
-    for (name, series) in merged.iter_mut() {
-        if !present.contains(name) {
+    for (index, (_, series)) in merged.iter_mut().enumerate() {
+        if index < seen.len() && !seen[index] {
             series.values.resize(end, None);
         }
     }
