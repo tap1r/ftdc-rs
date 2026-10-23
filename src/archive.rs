@@ -33,10 +33,11 @@
 //! type this build does not know is skipped and remembered, so metric
 //! chunks that follow it are still decoded.
 //!
-//! Inflation and delta reconstruction have no cross-chunk dependency, so
-//! each chunk runs on its own thread. The output does. Sample 0 of chunk
-//! N+1 is the sample after the last sample of chunk N. The handles are
-//! joined in the order they were spawned, and only then appended.
+//! Inflation and delta reconstruction have no cross-chunk dependency.
+//! Sample 0 of chunk N+1 is still the sample after the last sample of
+//! chunk N, so each blob is inflated, decoded, and appended before the
+//! next blob is touched. The compressed blobs in a real archive are tens
+//! of kilobytes; one pass keeps a single inflated buffer alive.
 
 use crate::decode::{append_chunk, decode_one_chunk, inflate_owned};
 use crate::errors::FileDecoderError;
@@ -46,7 +47,13 @@ use indexmap::IndexMap;
 use regex::Regex;
 use std::io::{BufReader, Read};
 use std::path::Path;
-use std::thread;
+
+/// A framed BSON document larger than this is rejected before the body
+/// is allocated. 16 MiB is the BSON maximum document size. A corrupt
+/// length near `i32::MAX` would otherwise reserve a multi-gigabyte buffer.
+/// An FTDC wrapper is far smaller: the metric blob is zlib of at most
+/// 10_000_000 uncompressed bytes.
+const MAX_FRAMED_DOCUMENT: usize = 16 * 1024 * 1024;
 
 /// `type` values on the BSON documents concatenated inside an FTDC archive.
 const TYPE_METADATA: i32 = 0;
@@ -159,6 +166,11 @@ fn read_length_prefixed_document<R: Read>(
         )));
     }
     let doc_len = doc_len as usize;
+    if doc_len > MAX_FRAMED_DOCUMENT {
+        return Err(FileDecoderError::format(format!(
+            "BSON document length {doc_len} exceeds the {MAX_FRAMED_DOCUMENT} byte limit"
+        )));
+    }
 
     let mut body = vec![0u8; doc_len];
     body[..4].copy_from_slice(&len_buf);
@@ -252,38 +264,18 @@ impl Archive {
         Ok(archive)
     }
 
-    /// Inflate every metric chunk, and return the chunks in file order.
-    ///
-    /// See the module docs for why the join order is the file order.
-    fn inflate_all(&self) -> Result<Vec<Vec<u8>>, FileDecoderError> {
-        let mut handles = Vec::with_capacity(self.chunks.len());
-        for chunk in &self.chunks {
-            let bytes = chunk.bytes.clone();
-            handles.push(thread::spawn(move || inflate_owned(bytes)));
-        }
-
-        let mut inflated = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let chunk = handle
-                .join()
-                .map_err(|_| FileDecoderError::format(format!("FTDC inflate thread panicked")))??;
-            inflated.push(chunk);
-        }
-        Ok(inflated)
-    }
-
     /// Decode every metric chunk and append the series in file order.
     ///
-    /// Each chunk is decoded on its own thread, because the reference
-    /// walk and the delta reconstruction do not look at other chunks.
-    /// The append does. A metric's samples are the concatenation of its
-    /// samples from chunk 0, then chunk 1, then chunk 2. Joining the
-    /// workers in spawn order and appending only after the previous
-    /// chunk has been appended is what keeps that concatenation in time
-    /// order.
+    /// One chunk is inflated, reconstructed, and appended before the next
+    /// chunk is read. A metric's samples are the concatenation of its
+    /// samples from chunk 0, then chunk 1, then chunk 2. Doing that on the
+    /// calling thread is what keeps the concatenation in time order.
     ///
-    /// A worker's `Err` stops the decode. `filter`, when set, keeps names
-    /// that match; the match is applied after the series are built.
+    /// `filter`, when set, keeps names that match. A rejected metric is
+    /// still walked, because the delta block is positional, and its
+    /// samples are not stored. The chunk still advances the row cursor by
+    /// `sample_count + 1`, so a metric that appears in a later chunk is
+    /// null for the rows the filter kept from earlier chunks.
     ///
     /// Metric names come back in the order they were first seen. That is
     /// the reference document's field order, then metrics introduced by
@@ -292,35 +284,20 @@ impl Archive {
         &self,
         filter: Option<Regex>,
     ) -> Result<IndexMap<String, Vec<Option<u64>>>, FileDecoderError> {
-        let data_chunks = self.inflate_all()?;
-        let mut handles = Vec::with_capacity(data_chunks.len());
-        for chunk in data_chunks {
-            handles.push(thread::spawn(move || decode_one_chunk(chunk)));
-        }
-
         let mut merged: IndexMap<String, Vec<Option<u64>>> = IndexMap::new();
         // How many samples the chunks already appended account for.
         // A metric that first appears later is null for these rows.
         let mut rows = 0usize;
-        for handle in handles {
-            let metrics = handle
-                .join()
-                .map_err(|_| FileDecoderError::format(format!("FTDC decode thread panicked")))??;
-            append_chunk(&mut merged, &mut rows, metrics)?;
+        for chunk in &self.chunks {
+            let inflated = inflate_owned(&chunk.bytes)?;
+            let keep = |name: &str| match &filter {
+                Some(expression) => expression.is_match(name),
+                None => true,
+            };
+            let (height, columns) = decode_one_chunk(inflated, &keep)?;
+            append_chunk(&mut merged, &mut rows, columns, height)?;
         }
-
-        match filter {
-            Some(re) => {
-                let mut matched_data: IndexMap<String, Vec<Option<u64>>> = IndexMap::new();
-                for (key, value) in merged {
-                    if re.is_match(&key) {
-                        matched_data.insert(key, value);
-                    }
-                }
-                Ok(matched_data)
-            }
-            None => Ok(merged),
-        }
+        Ok(merged)
     }
 
     /// Build a DataFrame whose columns are the decoded series.
