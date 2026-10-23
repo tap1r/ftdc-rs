@@ -27,6 +27,7 @@ mod extract;
 mod varint;
 
 pub use archive::{Archive, MetadataDelta, MetadataDocument, MetricChunk};
+pub use extract::{MetricColumn, MetricKind};
 
 #[cfg(test)]
 pub(crate) use extract::decimal_text_to_i64;
@@ -34,7 +35,7 @@ pub(crate) use extract::decimal_text_to_i64;
 #[cfg(test)]
 
 mod tests {
-    use crate::Archive;
+    use crate::{Archive, MetricColumn, MetricKind};
     use indexmap::IndexMap;
 
     #[test]
@@ -45,7 +46,7 @@ mod tests {
         assert!(message.contains("failed to open"), "{message}");
     }
 
-    fn open_decoded(path: impl AsRef<std::path::Path>) -> IndexMap<String, Vec<Option<u64>>> {
+    fn open_decoded(path: impl AsRef<std::path::Path>) -> IndexMap<String, MetricColumn> {
         Archive::open(path).unwrap().decode(None).unwrap()
     }
 
@@ -239,11 +240,11 @@ mod tests {
         let path = write_one_chunk(&reference, 2, 3, &[1, 1, 1, 0, 0, 0]);
         let series = open_decoded(&path);
         assert_eq!(
-            series.get("a").map(Vec::as_slice),
+            series.get("a").map(|column| column.values.as_slice()),
             Some([Some(1), Some(2), Some(3), Some(4)].as_slice())
         );
         assert_eq!(
-            series.get("x").map(Vec::as_slice),
+            series.get("x").map(|column| column.values.as_slice()),
             Some([Some(2), Some(2), Some(2), Some(2)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
@@ -251,11 +252,11 @@ mod tests {
         let reference_only = write_one_chunk(&reference, 2, 0, &[]);
         let series = open_decoded(&reference_only);
         assert_eq!(
-            series.get("a").map(Vec::as_slice),
+            series.get("a").map(|column| column.values.as_slice()),
             Some([Some(1)].as_slice())
         );
         assert_eq!(
-            series.get("x").map(Vec::as_slice),
+            series.get("x").map(|column| column.values.as_slice()),
             Some([Some(2)].as_slice())
         );
         let _ = std::fs::remove_file(&reference_only);
@@ -263,7 +264,7 @@ mod tests {
         let wide = bson::doc! { "n": 0i64 };
         let path = write_one_chunk(&wide, 1, 300, &vec![1u64; 300]);
         let series = open_decoded(&path);
-        let values = series.get("n").expect("metric n");
+        let values = &series.get("n").expect("metric n").values;
         assert_eq!(values.len(), 301);
         assert_eq!(values[0], Some(0));
         assert_eq!(values[300], Some(300));
@@ -286,11 +287,11 @@ mod tests {
         let series = open_decoded(&path);
         assert_eq!(series.len(), 2, "objectid and string must not be columns");
         assert_eq!(
-            series.get("n").map(Vec::as_slice),
+            series.get("n").map(|column| column.values.as_slice()),
             Some([Some(7)].as_slice())
         );
         assert_eq!(
-            series.get("ok").map(Vec::as_slice),
+            series.get("ok").map(|column| column.values.as_slice()),
             Some([Some(1)].as_slice())
         );
         assert!(!series.contains_key("id"));
@@ -317,7 +318,7 @@ mod tests {
         let path = write_one_chunk(&reference, 1, 0, &[]);
         let series = open_decoded(&path);
         assert_eq!(
-            series.get("amount").map(Vec::as_slice),
+            series.get("amount").map(|column| column.values.as_slice()),
             Some([Some(42)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
@@ -328,11 +329,15 @@ mod tests {
         let path = write_one_chunk(&reference, 2, 0, &[]);
         let series = open_decoded(&path);
         assert_eq!(
-            series.get("members.0.health").map(Vec::as_slice),
+            series
+                .get("members.0.health")
+                .map(|column| column.values.as_slice()),
             Some([Some(1)].as_slice())
         );
         assert_eq!(
-            series.get("members.1.health").map(Vec::as_slice),
+            series
+                .get("members.1.health")
+                .map(|column| column.values.as_slice()),
             Some([Some(2)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
@@ -359,7 +364,7 @@ mod tests {
 
         let series = open_decoded(&path);
         assert_eq!(
-            series.get("n").map(Vec::as_slice),
+            series.get("n").map(|column| column.values.as_slice()),
             Some([Some(10), Some(20)].as_slice()),
             "chunk 0's sample has to come before chunk 1's"
         );
@@ -393,11 +398,11 @@ mod tests {
 
         let series = open_decoded(&path);
         assert_eq!(
-            series.get("a").map(Vec::as_slice),
+            series.get("a").map(|column| column.values.as_slice()),
             Some([Some(1), Some(2), None].as_slice())
         );
         assert_eq!(
-            series.get("b").map(Vec::as_slice),
+            series.get("b").map(|column| column.values.as_slice()),
             Some([None, Some(3), Some(4)].as_slice())
         );
 
@@ -414,20 +419,29 @@ mod tests {
 
     #[test]
     fn test_to_dataframe() {
-        let mut test_metrics: IndexMap<String, Vec<Option<u64>>> = IndexMap::new();
+        let mut test_metrics: IndexMap<String, MetricColumn> = IndexMap::new();
         test_metrics.insert(
             "metric1".to_string(),
-            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+            MetricColumn {
+                kind: MetricKind::Int,
+                values: vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+            },
         );
         test_metrics.insert(
             "metric2".to_string(),
-            vec![Some(10), Some(20), Some(30), Some(40), Some(50)],
+            MetricColumn {
+                kind: MetricKind::Int,
+                values: vec![Some(10), Some(20), Some(30), Some(40), Some(50)],
+            },
         );
         // Already aligned. The nulls are the samples that did not exist.
         // The builder must not turn them into 0.
         test_metrics.insert(
             "metric3".to_string(),
-            vec![Some(100), Some(200), Some(300), None, None],
+            MetricColumn {
+                kind: MetricKind::Int,
+                values: vec![Some(100), Some(200), Some(300), None, None],
+            },
         );
 
         let df = Archive::metrics_to_dataframe(test_metrics).unwrap();
@@ -458,8 +472,20 @@ mod tests {
         assert_eq!(metric3_col.u64().unwrap().get(4), None);
 
         let mut ragged = IndexMap::new();
-        ragged.insert("a".to_string(), vec![Some(1u64), Some(2)]);
-        ragged.insert("b".to_string(), vec![Some(3u64)]);
+        ragged.insert(
+            "a".to_string(),
+            MetricColumn {
+                kind: MetricKind::Int,
+                values: vec![Some(1u64), Some(2)],
+            },
+        );
+        ragged.insert(
+            "b".to_string(),
+            MetricColumn {
+                kind: MetricKind::Int,
+                values: vec![Some(3u64)],
+            },
+        );
         assert!(Archive::metrics_to_dataframe(ragged).is_err());
     }
 
@@ -546,29 +572,39 @@ mod tests {
             ["z", "neg", "nested.m", "ts_time", "ts_increment", "wide"]
         );
         assert_eq!(
-            series.get("z").map(Vec::as_slice),
+            series.get("z").map(|column| column.values.as_slice()),
             Some([Some(1)].as_slice())
         );
         assert_eq!(
-            series.get("neg").map(Vec::as_slice),
+            series.get("neg").map(|column| column.values.as_slice()),
             Some([Some((-1i64) as u64)].as_slice())
         );
         assert_eq!(
-            series.get("nested.m").map(Vec::as_slice),
+            series
+                .get("nested.m")
+                .map(|column| column.values.as_slice()),
             Some([Some(3)].as_slice())
         );
         assert_eq!(
-            series.get("ts_time").map(Vec::as_slice),
+            series.get("ts_time").map(|column| column.values.as_slice()),
             Some([Some(5)].as_slice())
         );
         assert_eq!(
-            series.get("ts_increment").map(Vec::as_slice),
+            series
+                .get("ts_increment")
+                .map(|column| column.values.as_slice()),
             Some([Some(7)].as_slice())
         );
         assert_eq!(
-            series.get("wide").map(Vec::as_slice),
+            series.get("wide").map(|column| column.values.as_slice()),
             Some([Some(i64::MAX as u64)].as_slice())
         );
+        assert_eq!(series["z"].kind, MetricKind::Double);
+        assert_eq!(series["neg"].kind, MetricKind::Double);
+        assert_eq!(series["nested.m"].kind, MetricKind::Int);
+        assert_eq!(series["ts_time"].kind, MetricKind::TimestampSeconds);
+        assert_eq!(series["ts_increment"].kind, MetricKind::TimestampIncrement);
+        assert_eq!(series["wide"].kind, MetricKind::Double);
 
         let df = Archive::metrics_to_dataframe(series).unwrap();
         let columns: Vec<String> = df
@@ -601,12 +637,14 @@ mod tests {
         let series = open_decoded(&ordered);
         let names: Vec<&str> = series.keys().map(String::as_str).collect();
         assert_eq!(names, ["z", "a", "m"]);
+        assert_eq!(series["z"].kind, MetricKind::Int);
+        assert_eq!(series["m"].kind, MetricKind::Int);
         assert_eq!(
-            series.get("a").map(Vec::as_slice),
+            series.get("a").map(|column| column.values.as_slice()),
             Some([Some(2), None].as_slice())
         );
         assert_eq!(
-            series.get("m").map(Vec::as_slice),
+            series.get("m").map(|column| column.values.as_slice()),
             Some([None, Some(3)].as_slice())
         );
         let _ = std::fs::remove_file(&first);
@@ -682,6 +720,7 @@ mod tests {
         assert_eq!(json["documentCount"], serde_json::json!(5));
         assert_eq!(json["skippedChunkTypes"], serde_json::json!([9]));
         assert_eq!(json["metrics"], serde_json::json!(["n"]));
+        assert_eq!(json["metricTypes"]["n"], "int");
 
         use polars::prelude::SerReader;
         let mut file = std::fs::File::open(&parquet).unwrap();
@@ -794,6 +833,8 @@ mod tests {
         );
         assert_eq!(json["documentCount"], serde_json::json!(3));
         assert_eq!(json["metrics"], serde_json::json!(["a", "x"]));
+        assert_eq!(json["metricTypes"]["a"], "int");
+        assert_eq!(json["metricTypes"]["x"], "int");
 
         let _ = std::fs::remove_file(&chunk);
         let _ = std::fs::remove_file(&input);
@@ -813,11 +854,11 @@ mod tests {
         let path = write_one_chunk(&reference, 2, 2, &[5, 0, 0, 7]);
         let series = open_decoded(&path);
         assert_eq!(
-            series.get("a").map(Vec::as_slice),
+            series.get("a").map(|column| column.values.as_slice()),
             Some([Some(1), Some(6), Some(6)].as_slice())
         );
         assert_eq!(
-            series.get("b").map(Vec::as_slice),
+            series.get("b").map(|column| column.values.as_slice()),
             Some([Some(2), Some(2), Some(9)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
@@ -825,7 +866,7 @@ mod tests {
         let path = write_one_chunk(&bson::doc! { "n": 5i64 }, 1, 1, &[u64::MAX]);
         let series = open_decoded(&path);
         assert_eq!(
-            series.get("n").map(Vec::as_slice),
+            series.get("n").map(|column| column.values.as_slice()),
             Some([Some(5), Some(4)].as_slice())
         );
         let _ = std::fs::remove_file(&path);
@@ -928,9 +969,41 @@ mod tests {
         let names: Vec<&str> = series.keys().map(String::as_str).collect();
         assert_eq!(names, ["c"]);
         assert_eq!(
-            series.get("c").map(Vec::as_slice),
+            series.get("c").map(|column| column.values.as_slice()),
             Some([None, Some(4)].as_slice())
         );
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The kind is fixed by the chunk that introduces the name. int32 and
+    /// int64 are both `int`. A double under the same name is a different rule.
+    #[test]
+    fn metric_kind_follows_the_reference_field() {
+        let path = write_one_chunk(
+            &bson::doc! { "n": 1i32, "flag": true, "when": bson::DateTime::from_millis(5) },
+            3,
+            0,
+            &[],
+        );
+        let series = open_decoded(&path);
+        assert_eq!(series["n"].kind, MetricKind::Int);
+        assert_eq!(series["flag"].kind, MetricKind::Bool);
+        assert_eq!(series["flag"].values, vec![Some(1)]);
+        assert_eq!(series["when"].kind, MetricKind::Date);
+        assert_eq!(series["when"].values, vec![Some(5)]);
+        let _ = std::fs::remove_file(&path);
+
+        let first = write_one_chunk(&bson::doc! { "n": 1i32 }, 1, 0, &[]);
+        let second = write_one_chunk(&bson::doc! { "n": 1.5 }, 1, 0, &[]);
+        let mut bytes = std::fs::read(&first).unwrap();
+        bytes.extend(std::fs::read(&second).unwrap());
+        let path = std::env::temp_dir().join(format!("ftdc-rs-kind-{}.bin", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let err = Archive::open(&path).unwrap().decode(None).unwrap_err();
+        assert!(err.to_string().contains("double"), "{err}");
+        assert!(err.to_string().contains("int"), "{err}");
         let _ = std::fs::remove_file(&first);
         let _ = std::fs::remove_file(&second);
         let _ = std::fs::remove_file(&path);
