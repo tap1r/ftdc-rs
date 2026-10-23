@@ -41,11 +41,11 @@
 
 use crate::decode::{append_chunk, decode_one_chunk, inflate_owned};
 use crate::errors::FileDecoderError;
-use crate::export::write_metrics_parquet;
+#[cfg(feature = "parquet")]
+use crate::export::write_parquet;
 use crate::extract::MetricColumn;
 use bson::{Bson, Document};
 use indexmap::IndexMap;
-use regex::Regex;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
@@ -139,6 +139,7 @@ pub struct Archive {
 /// sizes the buffer, which is how a BSON reader consumes a framing stream.
 fn read_length_prefixed_document<R: Read>(
     reader: &mut R,
+    path: &Path,
 ) -> Result<Option<Document>, FileDecoderError> {
     let mut len_buf = [0u8; 4];
     let mut filled = 0usize;
@@ -146,29 +147,27 @@ fn read_length_prefixed_document<R: Read>(
         match reader.read(&mut len_buf[filled..]) {
             Ok(0) if filled == 0 => return Ok(None),
             Ok(0) => {
-                return Err(FileDecoderError::format(format!(
+                return Err(FileDecoderError::truncated(format!(
                     "FTDC archive ends in the middle of a BSON document length ({filled} of 4 bytes)"
                 )));
             }
             Ok(n) => filled += n,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                return Err(FileDecoderError::format(format!(
-                    "failed to read FTDC archive: {error}"
-                )));
+                return Err(FileDecoderError::io("failed to read", path, error));
             }
         }
     }
 
     let doc_len = i32::from_le_bytes(len_buf);
     if doc_len < 5 {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::truncated(format!(
             "BSON document length {doc_len} is smaller than 5"
         )));
     }
     let doc_len = doc_len as usize;
     if doc_len > MAX_FRAMED_DOCUMENT {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::size_limit(format!(
             "BSON document length {doc_len} exceeds the {MAX_FRAMED_DOCUMENT} byte limit"
         )));
     }
@@ -177,10 +176,10 @@ fn read_length_prefixed_document<R: Read>(
     body[..4].copy_from_slice(&len_buf);
     if let Err(error) = reader.read_exact(&mut body[4..]) {
         return Err(match error.kind() {
-            std::io::ErrorKind::UnexpectedEof => FileDecoderError::format(format!(
+            std::io::ErrorKind::UnexpectedEof => FileDecoderError::truncated(format!(
                 "FTDC archive ends in the middle of a BSON document of {doc_len} bytes"
             )),
-            _ => FileDecoderError::format(format!("failed to read FTDC archive: {error}")),
+            _ => FileDecoderError::io("failed to read", path, error),
         });
     }
 
@@ -216,7 +215,7 @@ impl Archive {
         };
 
         loop {
-            match read_length_prefixed_document(&mut reader)? {
+            match read_length_prefixed_document(&mut reader, file_name)? {
                 None => break,
                 Some(metrics) => {
                     // Count this document even when we skip it, so
@@ -272,21 +271,18 @@ impl Archive {
     /// samples from chunk 0, then chunk 1, then chunk 2. Doing that on the
     /// calling thread is what keeps the concatenation in time order.
     ///
-    /// `filter`, when set, keeps names that match. A rejected metric is
-    /// still walked, because the delta block is positional, and its
-    /// samples are not stored. The chunk still advances the row cursor by
-    /// `sample_count + 1`, so a metric that appears in a later chunk is
-    /// null for the rows the filter kept from earlier chunks.
+    /// `keep` selects names. A rejected metric is still walked, because
+    /// the delta block is positional, and its samples are not stored. The
+    /// chunk still advances the row cursor by `sample_count + 1`, so a
+    /// metric that appears in a later chunk is null for the rows an
+    /// earlier chunk contributed. Pass `|_| true` to keep every metric.
     ///
     /// Metric names come back in the order they were first seen. That is
     /// the reference document's field order, then metrics introduced by
-    /// later chunks. Each column carries the compressor rule that produced
-    /// its `u64` bits. That rule is fixed by the chunk that introduced the
-    /// name; a later chunk that classifies the same path differently is
-    /// an error.
+    /// later chunks.
     pub fn decode(
         &self,
-        filter: Option<Regex>,
+        mut keep: impl FnMut(&str) -> bool,
     ) -> Result<IndexMap<String, MetricColumn>, FileDecoderError> {
         let mut merged: IndexMap<String, MetricColumn> = IndexMap::new();
         // How many samples the chunks already appended account for.
@@ -294,17 +290,52 @@ impl Archive {
         let mut rows = 0usize;
         for chunk in &self.chunks {
             let inflated = inflate_owned(&chunk.bytes)?;
-            let keep = |name: &str| match &filter {
-                Some(expression) => expression.is_match(name),
-                None => true,
-            };
-            let (height, columns) = decode_one_chunk(inflated, &keep)?;
+            let (height, columns) = decode_one_chunk(inflated, &mut keep)?;
             append_chunk(&mut merged, &mut rows, columns, height)?;
         }
         Ok(merged)
     }
 
+    /// Write the metadata sidecar for `metrics`.
+    ///
+    /// `metrics` and `metricTypes` follow the column order. `_id` is relaxed
+    /// extended JSON. `count` on a delta is the encoder generation. This
+    /// does not write Parquet and does not need the `parquet` feature.
+    pub fn write_sidecar(
+        &self,
+        metrics: &IndexMap<String, MetricColumn>,
+        path: impl AsRef<Path>,
+    ) -> Result<(), FileDecoderError> {
+        let path = path.as_ref();
+        let mut body = self.sidecar_preamble();
+        let Some(object) = body.as_object_mut() else {
+            return Err(FileDecoderError::format(format!(
+                "metadata sidecar preamble is not a JSON object"
+            )));
+        };
+        let names: Vec<&str> = metrics.keys().map(String::as_str).collect();
+        let kinds: serde_json::Map<String, serde_json::Value> = metrics
+            .iter()
+            .map(|(name, column)| {
+                (
+                    name.clone(),
+                    serde_json::Value::String(column.kind.as_str().to_string()),
+                )
+            })
+            .collect();
+        object.insert("metrics".to_string(), serde_json::json!(names));
+        object.insert("metricTypes".to_string(), serde_json::Value::Object(kinds));
+        let json = serde_json::to_string_pretty(&body).map_err(|error| {
+            FileDecoderError::format(format!("failed to serialize metadata to JSON: {error}"))
+        })?;
+        std::fs::write(path, json)
+            .map_err(|error| FileDecoderError::io("failed to write", path, error))
+    }
+
     /// Build a DataFrame whose columns are the decoded series.
+    ///
+    /// Available with the `parquet` feature, which is on by default.
+    #[cfg(feature = "parquet")]
     pub fn metrics_to_dataframe(
         metrics: IndexMap<String, MetricColumn>,
     ) -> Result<polars::prelude::DataFrame, FileDecoderError> {
@@ -316,30 +347,30 @@ impl Archive {
     /// `metadata`, when set, is the path of the sidecar. It receives every
     /// type 0 wrapper and every type 2 wrapper: `_id`, and for a delta the
     /// generation `count`, plus the embedded `doc` as relaxed extended JSON.
+    /// `keep` selects metric names; `|_| true` keeps every column.
+    ///
+    /// Available with the `parquet` feature, which is on by default.
+    #[cfg(feature = "parquet")]
     pub fn write_to_parquet(
         input_file_name: impl AsRef<Path>,
         output_file_name: impl AsRef<Path>,
         metadata: Option<&Path>,
-        filter: Option<Regex>,
+        keep: impl FnMut(&str) -> bool,
     ) -> Result<(), FileDecoderError> {
         let archive = Archive::open(input_file_name)?;
-        let metrics = archive.decode(filter)?;
-        write_metrics_parquet(
-            metrics,
-            output_file_name.as_ref(),
-            metadata,
-            archive.sidecar_preamble(),
-        )
+        let metrics = archive.decode(keep)?;
+        if let Some(path) = metadata {
+            archive.write_sidecar(&metrics, path)?;
+        }
+        write_parquet(metrics, output_file_name.as_ref())
     }
 
-    /// Sidecar object without `metrics` and `metricTypes`.
+    /// Sidecar object without the `metrics` list.
     ///
-    /// Those two are filled from the decoded columns, in first-seen order,
-    /// which is the Parquet column order. `metricTypes` names the compressor
-    /// rule (`int`, `double`, `decimal`, `bool`, `date`, `timestampSeconds`,
-    /// `timestampIncrement`). The cell values stay `u64`. `_id` is relaxed
-    /// extended JSON (`$date` for the timestamp the server writes). `doc` is
-    /// the embedded collector document, also relaxed extended JSON.
+    /// The column names are inserted after the DataFrame exists, so they
+    /// follow the same order as the Parquet file. `_id` is relaxed extended
+    /// JSON (`$date` for the timestamp the server writes). `doc` is the
+    /// embedded collector document, also relaxed extended JSON.
     pub(crate) fn sidecar_preamble(&self) -> serde_json::Value {
         serde_json::json!({
             "metadata": self.metadata.iter().map(metadata_json).collect::<Vec<_>>(),
@@ -385,12 +416,14 @@ fn chunk_type_of(doc: &Document) -> Result<i32, FileDecoderError> {
     match doc.get("type") {
         Some(Bson::Int32(value)) => Ok(*value),
         Some(Bson::Int64(value)) => i32::try_from(*value).map_err(|_| {
-            FileDecoderError::format(format!("FTDC chunk type {value} does not fit in an int32"))
+            FileDecoderError::chunk_type(format!(
+                "FTDC chunk type {value} does not fit in an int32"
+            ))
         }),
-        Some(other) => Err(FileDecoderError::format(format!(
+        Some(other) => Err(FileDecoderError::chunk_type(format!(
             "FTDC chunk type is {other:?}, expected an int"
         ))),
-        None => Err(FileDecoderError::format(format!(
+        None => Err(FileDecoderError::chunk_type(format!(
             "'type' key not found in chunk"
         ))),
     }

@@ -44,6 +44,12 @@ names the compressor rule for each column (`int`, `double`, `decimal`,
 `bool`, `date`, `timestampSeconds`, `timestampIncrement`). The column
 values stay the `u64` bit patterns those rules produce.
 
+`Archive::decode` takes a predicate, `|name| ...`, and passes every
+name through it once while that metric's deltas are consumed. The
+`ftdc-rs` binary turns `--filter` into that predicate. Polars is the
+`parquet` feature, on by default. Without it the library still opens
+an archive, decodes the columns, and writes the sidecar.
+
 ## Example
 
 Decode the archives in `mongo-diag-0` into the current directory, and
