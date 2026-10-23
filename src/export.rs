@@ -10,23 +10,19 @@
 //! length is rejected. The merge in `decode` is what inserts the nulls
 //! on the side where the metric was absent.
 //!
-//! The sidecar is relaxed extended JSON. `metadata` is every type 0 `doc`,
-//! and `metadataDeltas` is every type 2 `doc`, in file order. Dates,
-//! ObjectIds, and timestamps keep their extended-JSON forms (`$date`,
-//! `$oid`, `$timestamp`). Integers and strings stay JSON values. An earlier
-//! sidecar kept only the last document of each kind, rendered with
-//! `Document`'s `Display`, under the keys `metadata` and `parameters`.
+//! The sidecar is relaxed extended JSON. `metadata` is every type 0
+//! wrapper (`_id` and `doc`). `metadataDeltas` is every type 2 wrapper
+//! (`_id`, `count`, and `doc`), in file order. Dates, ObjectIds, and
+//! timestamps keep their extended-JSON forms (`$date`, `$oid`,
+//! `$timestamp`). Integers and strings stay JSON values. `count` is the
+//! delta encoder's generation, not a sample index. An earlier sidecar kept
+//! only the inner `doc`, and before that only the last document of each
+//! kind, rendered with `Document`'s `Display`.
 
 use crate::errors::FileDecoderError;
-use bson::{Bson, Document};
 use indexmap::IndexMap;
 use polars::prelude::*;
 use std::path::Path;
-
-/// Relaxed extended JSON v2 for one metadata document.
-fn relaxed_extended_json(doc: &Document) -> serde_json::Value {
-    Bson::Document(doc.clone()).into_relaxed_extjson()
-}
 
 /// Build a DataFrame whose columns are the decoded series.
 ///
@@ -63,10 +59,7 @@ pub(crate) fn write_metrics_parquet(
     metrics: IndexMap<String, Vec<Option<u64>>>,
     output_file_name: &Path,
     metadata_path: Option<&Path>,
-    metadata_docs: &[Document],
-    metadata_deltas: &[Document],
-    document_count: usize,
-    skipped_chunk_types: &[i32],
+    mut preamble: serde_json::Value,
 ) -> Result<(), FileDecoderError> {
     let mut df = metrics_to_dataframe(metrics)?;
 
@@ -89,18 +82,18 @@ pub(crate) fn write_metrics_parquet(
             .map(|name| name.to_string())
             .collect();
 
-        // Every metadata document, not the last one. `documentCount` counts
+        // Column order matches the Parquet file. `documentCount` counts
         // every BSON document in the archive, including metric chunks and
         // types this build skipped. `skippedChunkTypes` is that list.
-        let json_data = serde_json::json!({
-            "metadata": metadata_docs.iter().map(relaxed_extended_json).collect::<Vec<_>>(),
-            "metadataDeltas": metadata_deltas.iter().map(relaxed_extended_json).collect::<Vec<_>>(),
-            "documentCount": document_count,
-            "skippedChunkTypes": skipped_chunk_types,
-            "metrics": metric_names,
-        });
+        // The preamble already holds the type 0 and type 2 wrappers.
+        let Some(object) = preamble.as_object_mut() else {
+            return Err(FileDecoderError::format(format!(
+                "metadata sidecar preamble is not a JSON object"
+            )));
+        };
+        object.insert("metrics".to_string(), serde_json::json!(metric_names));
 
-        let json_string = serde_json::to_string_pretty(&json_data).map_err(|error| {
+        let json_string = serde_json::to_string_pretty(&preamble).map_err(|error| {
             FileDecoderError::format(format!("failed to serialize metadata to JSON: {error}"))
         })?;
 

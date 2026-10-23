@@ -5,7 +5,9 @@
 //!
 //! * `archive` reads each length-prefixed document and records it by `type`.
 //!   Type 0 is metadata, type 1 is a compressed metric chunk, type 2 is a
-//!   periodic metadata delta. A type this build does not know is skipped.
+//!   periodic metadata delta. The wrapper `_id` (and, for type 2, `count`)
+//!   is kept with the embedded `doc`. A type this build does not know is
+//!   skipped.
 //! * `decode` inflates a metric chunk and rebuilds each series from the
 //!   reference sample plus the delta block.
 //! * `extract` walks the reference document and keeps the numeric fields
@@ -24,7 +26,7 @@ mod export;
 mod extract;
 mod varint;
 
-pub use archive::FTDCFileDecoder;
+pub use archive::{Archive, MetadataDelta, MetadataDocument, MetricChunk};
 
 #[cfg(test)]
 pub(crate) use extract::decimal_text_to_i64;
@@ -32,21 +34,19 @@ pub(crate) use extract::decimal_text_to_i64;
 #[cfg(test)]
 
 mod tests {
-    use crate::FTDCFileDecoder;
+    use crate::Archive;
     use indexmap::IndexMap;
 
     #[test]
     fn test_file_doesnt_exist() {
-        let mut bad_file = FTDCFileDecoder::new();
-        let result = bad_file.read_file("unexistent");
-        match result {
-            Ok(_read) => {
-                assert!(false)
-            }
-            Err(e) => {
-                println!("Got expected error {e:?}");
-            }
-        }
+        let error = Archive::open("unexistent").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unexistent"), "{message}");
+        assert!(message.contains("failed to open"), "{message}");
+    }
+
+    fn open_decoded(path: impl AsRef<std::path::Path>) -> IndexMap<String, Vec<Option<u64>>> {
+        Archive::open(path).unwrap().decode(None).unwrap()
     }
 
     /// A MongoDB 7+ archive starts with metadata, then a type 2 delta,
@@ -86,22 +86,33 @@ mod tests {
         }
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut parsed_file = FTDCFileDecoder::new();
-        parsed_file
-            .read_file(path.to_str().unwrap())
-            .expect("type 2 and an unknown type are not fatal");
+        let parsed_file = Archive::open(&path).expect("type 2 and an unknown type are not fatal");
 
-        assert_eq!(parsed_file.metadata_docs.len(), 1);
+        assert_eq!(parsed_file.metadata.len(), 1);
         assert_eq!(
-            parsed_file.metadata_docs[0].get_str("host").unwrap(),
+            parsed_file.metadata[0].doc.get_str("host").unwrap(),
             "a.example"
         );
+        assert!(parsed_file.metadata[0].id.is_some());
         assert_eq!(parsed_file.metadata_deltas.len(), 2);
-        assert_eq!(parsed_file.metadata_deltas[0].get_i32("param").unwrap(), 1);
-        assert_eq!(parsed_file.metadata_deltas[1].get_i32("param").unwrap(), 2);
+        assert_eq!(parsed_file.metadata_deltas[0].count, 0);
+        assert_eq!(
+            parsed_file.metadata_deltas[0].doc.get_i32("param").unwrap(),
+            1
+        );
+        assert_eq!(parsed_file.metadata_deltas[1].count, 1);
+        assert_eq!(
+            parsed_file.metadata_deltas[1].doc.get_i32("param").unwrap(),
+            2
+        );
         assert_eq!(parsed_file.skipped_chunk_types, vec![9]);
         assert_eq!(parsed_file.document_count, 4);
-        assert!(parsed_file.binary_chunks.is_empty());
+        assert!(parsed_file.chunks.is_empty());
+
+        // A second open is a second file. The first archive does not grow.
+        let again = Archive::open(&path).unwrap();
+        assert_eq!(again.document_count, parsed_file.document_count);
+        assert_eq!(parsed_file.document_count, 4);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -213,10 +224,7 @@ mod tests {
         let reference = bson::doc! { "a": 1i32, "x": 2i32, "s": "t" };
         // a grows 1,2,3,4. x stays 2. Three zeros encode as [0, 2].
         let path = write_one_chunk(&reference, 2, 3, &[1, 1, 1, 0, 0, 0]);
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         assert_eq!(
             series.get("a").map(Vec::as_slice),
             Some([Some(1), Some(2), Some(3), Some(4)].as_slice())
@@ -228,10 +236,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let reference_only = write_one_chunk(&reference, 2, 0, &[]);
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(reference_only.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&reference_only);
         assert_eq!(
             series.get("a").map(Vec::as_slice),
             Some([Some(1)].as_slice())
@@ -244,10 +249,7 @@ mod tests {
 
         let wide = bson::doc! { "n": 0i64 };
         let path = write_one_chunk(&wide, 1, 300, &vec![1u64; 300]);
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         let values = series.get("n").expect("metric n");
         assert_eq!(values.len(), 301);
         assert_eq!(values[0], Some(0));
@@ -268,10 +270,7 @@ mod tests {
             "ok": true,
         };
         let path = write_one_chunk(&reference, 2, 0, &[]);
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         assert_eq!(series.len(), 2, "objectid and string must not be columns");
         assert_eq!(
             series.get("n").map(Vec::as_slice),
@@ -291,11 +290,10 @@ mod tests {
         // not be applied. The check is on the chunk itself; the threaded
         // merge still drops worker errors, and that is fixed separately.
         let path = write_one_chunk(&reference, 3, 0, &[]);
-        let mut parsed = FTDCFileDecoder::new();
-        parsed.read_file(path.to_str().unwrap()).unwrap();
-        let inflated = parsed.uncompress_data().unwrap();
-        let mut metrics = crate::extract::extract_metric_meta_data(&inflated[0]).unwrap();
-        let err = crate::decode::extract_all_metrics_from_buffer(&mut metrics, &inflated[0])
+        let parsed = Archive::open(&path).unwrap();
+        let inflated = crate::decode::inflate_owned(parsed.chunks[0].bytes.clone()).unwrap();
+        let mut metrics = crate::extract::extract_metric_meta_data(&inflated).unwrap();
+        let err = crate::decode::extract_all_metrics_from_buffer(&mut metrics, &inflated)
             .expect_err("a walk that does not match metric_count must fail");
         let message = err.to_string();
         assert!(message.contains("3"), "{message}");
@@ -304,10 +302,7 @@ mod tests {
         let decimal: bson::Decimal128 = "42.9".parse().unwrap();
         let reference = bson::doc! { "amount": decimal };
         let path = write_one_chunk(&reference, 1, 0, &[]);
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         assert_eq!(
             series.get("amount").map(Vec::as_slice),
             Some([Some(42)].as_slice())
@@ -318,10 +313,7 @@ mod tests {
             "members": [ { "health": 1i32 }, { "health": 2i32 } ]
         };
         let path = write_one_chunk(&reference, 2, 0, &[]);
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         assert_eq!(
             series.get("members.0.health").map(Vec::as_slice),
             Some([Some(1)].as_slice())
@@ -352,10 +344,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ftdc-rs-order-{}.bin", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         assert_eq!(
             series.get("n").map(Vec::as_slice),
             Some([Some(10), Some(20)].as_slice()),
@@ -368,10 +357,10 @@ mod tests {
         let oid = bson::oid::ObjectId::from_bytes([0x22; 12]);
         let reference = bson::doc! { "id": oid, "n": 1i32 };
         let path = write_one_chunk(&reference, 2, 0, &[]);
-        let mut parsed = FTDCFileDecoder::new();
-        let err = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .expect_err("metric_count mismatch must fail read_and_decode");
+        let err = Archive::open(&path)
+            .unwrap()
+            .decode(None)
+            .expect_err("metric_count mismatch must fail decode");
         assert!(err.to_string().contains("2"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
@@ -389,10 +378,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ftdc-rs-nulls-{}.bin", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
 
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         assert_eq!(
             series.get("a").map(Vec::as_slice),
             Some([Some(1), Some(2), None].as_slice())
@@ -402,7 +388,7 @@ mod tests {
             Some([None, Some(3), Some(4)].as_slice())
         );
 
-        let df = FTDCFileDecoder::metrics_to_dataframe(series).unwrap();
+        let df = Archive::metrics_to_dataframe(series).unwrap();
         assert_eq!(df.height(), 3);
         assert_eq!(df.column("b").unwrap().u64().unwrap().get(0), None);
         assert_eq!(df.column("a").unwrap().u64().unwrap().get(2), None);
@@ -431,7 +417,7 @@ mod tests {
             vec![Some(100), Some(200), Some(300), None, None],
         );
 
-        let df = FTDCFileDecoder::metrics_to_dataframe(test_metrics).unwrap();
+        let df = Archive::metrics_to_dataframe(test_metrics).unwrap();
         assert_eq!(df.width(), 3);
         assert_eq!(df.height(), 5);
         // Insertion order is the column order. metric1 was inserted first.
@@ -461,7 +447,7 @@ mod tests {
         let mut ragged = IndexMap::new();
         ragged.insert("a".to_string(), vec![Some(1u64), Some(2)]);
         ragged.insert("b".to_string(), vec![Some(3u64)]);
-        assert!(FTDCFileDecoder::metrics_to_dataframe(ragged).is_err());
+        assert!(Archive::metrics_to_dataframe(ragged).is_err());
     }
 
     /// Each document in an archive starts with its BSON length. Ending on a
@@ -472,15 +458,13 @@ mod tests {
         let dir = std::env::temp_dir();
         let empty = dir.join(format!("ftdc-rs-empty-{}.bin", std::process::id()));
         std::fs::write(&empty, []).unwrap();
-        let mut parsed = FTDCFileDecoder::new();
-        parsed.read_file(empty.to_str().unwrap()).unwrap();
+        let parsed = Archive::open(&empty).unwrap();
         assert_eq!(parsed.document_count, 0);
         let _ = std::fs::remove_file(&empty);
 
         let short = dir.join(format!("ftdc-rs-short-{}.bin", std::process::id()));
         std::fs::write(&short, [1u8, 0]).unwrap();
-        let mut parsed = FTDCFileDecoder::new();
-        let err = parsed.read_file(short.to_str().unwrap()).unwrap_err();
+        let err = Archive::open(&short).unwrap_err();
         assert!(err.to_string().contains("middle"), "{err}");
         let _ = std::fs::remove_file(&short);
 
@@ -494,8 +478,7 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 3]);
         let cut = dir.join(format!("ftdc-rs-cut-{}.bin", std::process::id()));
         std::fs::write(&cut, &bytes).unwrap();
-        let mut parsed = FTDCFileDecoder::new();
-        let err = parsed.read_file(cut.to_str().unwrap()).unwrap_err();
+        let err = Archive::open(&cut).unwrap_err();
         assert!(err.to_string().contains("middle"), "{err}");
         let _ = std::fs::remove_file(&cut);
     }
@@ -543,10 +526,7 @@ mod tests {
         };
         reference.insert("wide", f64::INFINITY);
         let path = write_one_chunk(&reference, 6, 0, &[]);
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(path.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&path);
         let names: Vec<&str> = series.keys().map(String::as_str).collect();
         assert_eq!(
             names,
@@ -577,7 +557,7 @@ mod tests {
             Some([Some(i64::MAX as u64)].as_slice())
         );
 
-        let df = FTDCFileDecoder::metrics_to_dataframe(series).unwrap();
+        let df = Archive::metrics_to_dataframe(series).unwrap();
         let columns: Vec<String> = df
             .get_column_names()
             .iter()
@@ -605,10 +585,7 @@ mod tests {
         let ordered =
             std::env::temp_dir().join(format!("ftdc-rs-order-cols-{}.bin", std::process::id()));
         std::fs::write(&ordered, bytes).unwrap();
-        let mut parsed = FTDCFileDecoder::new();
-        let series = parsed
-            .read_and_decode(ordered.to_str().unwrap(), None)
-            .unwrap();
+        let series = open_decoded(&ordered);
         let names: Vec<&str> = series.keys().map(String::as_str).collect();
         assert_eq!(names, ["z", "a", "m"]);
         assert_eq!(
@@ -670,16 +647,25 @@ mod tests {
         let sidecar = dir.join(format!("ftdc-rs-meta-{}.metadata.json", std::process::id()));
         std::fs::write(&input, bytes).unwrap();
 
-        FTDCFileDecoder::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
+        Archive::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
 
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
         assert!(json.get("parameters").is_none());
         assert_eq!(json["metadata"].as_array().unwrap().len(), 1);
-        assert_eq!(json["metadata"][0]["host"], "a.example");
+        assert_eq!(json["metadata"][0]["doc"]["host"], "a.example");
+        assert!(json["metadata"][0]["_id"]["$date"].is_string());
         assert_eq!(json["metadataDeltas"].as_array().unwrap().len(), 2);
-        assert_eq!(json["metadataDeltas"][0]["param"], serde_json::json!(1));
-        assert_eq!(json["metadataDeltas"][1]["param"], serde_json::json!(2));
+        assert_eq!(json["metadataDeltas"][0]["count"], serde_json::json!(0));
+        assert_eq!(
+            json["metadataDeltas"][0]["doc"]["param"],
+            serde_json::json!(1)
+        );
+        assert_eq!(json["metadataDeltas"][1]["count"], serde_json::json!(1));
+        assert_eq!(
+            json["metadataDeltas"][1]["doc"]["param"],
+            serde_json::json!(2)
+        );
         assert_eq!(json["documentCount"], serde_json::json!(5));
         assert_eq!(json["skippedChunkTypes"], serde_json::json!([9]));
         assert_eq!(json["metrics"], serde_json::json!(["n"]));
@@ -749,7 +735,7 @@ mod tests {
         ));
         std::fs::write(&input, bytes).unwrap();
 
-        FTDCFileDecoder::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
+        Archive::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
 
         use polars::prelude::SerReader;
         let mut file = std::fs::File::open(&parquet).unwrap();
@@ -785,9 +771,14 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
-        assert_eq!(json["metadata"][0]["host"], "a.example");
-        assert!(json["metadata"][0]["start"]["$date"].is_string());
-        assert_eq!(json["metadataDeltas"][0]["param"], serde_json::json!(7));
+        assert_eq!(json["metadata"][0]["doc"]["host"], "a.example");
+        assert!(json["metadata"][0]["doc"]["start"]["$date"].is_string());
+        assert!(json["metadata"][0]["_id"]["$date"].is_string());
+        assert_eq!(json["metadataDeltas"][0]["count"], serde_json::json!(0));
+        assert_eq!(
+            json["metadataDeltas"][0]["doc"]["param"],
+            serde_json::json!(7)
+        );
         assert_eq!(json["documentCount"], serde_json::json!(3));
         assert_eq!(json["metrics"], serde_json::json!(["a", "x"]));
 
