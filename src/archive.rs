@@ -42,6 +42,7 @@
 use crate::decode::{append_chunk, decode_one_chunk, inflate_owned};
 use crate::errors::FileDecoderError;
 use crate::export::write_metrics_parquet;
+use crate::extract::MetricColumn;
 use bson::{Bson, Document};
 use indexmap::IndexMap;
 use regex::Regex;
@@ -279,12 +280,15 @@ impl Archive {
     ///
     /// Metric names come back in the order they were first seen. That is
     /// the reference document's field order, then metrics introduced by
-    /// later chunks.
+    /// later chunks. Each column carries the compressor rule that produced
+    /// its `u64` bits. That rule is fixed by the chunk that introduced the
+    /// name; a later chunk that classifies the same path differently is
+    /// an error.
     pub fn decode(
         &self,
         filter: Option<Regex>,
-    ) -> Result<IndexMap<String, Vec<Option<u64>>>, FileDecoderError> {
-        let mut merged: IndexMap<String, Vec<Option<u64>>> = IndexMap::new();
+    ) -> Result<IndexMap<String, MetricColumn>, FileDecoderError> {
+        let mut merged: IndexMap<String, MetricColumn> = IndexMap::new();
         // How many samples the chunks already appended account for.
         // A metric that first appears later is null for these rows.
         let mut rows = 0usize;
@@ -302,7 +306,7 @@ impl Archive {
 
     /// Build a DataFrame whose columns are the decoded series.
     pub fn metrics_to_dataframe(
-        metrics: IndexMap<String, Vec<Option<u64>>>,
+        metrics: IndexMap<String, MetricColumn>,
     ) -> Result<polars::prelude::DataFrame, FileDecoderError> {
         crate::export::metrics_to_dataframe(metrics)
     }
@@ -328,12 +332,14 @@ impl Archive {
         )
     }
 
-    /// Sidecar object without the `metrics` list.
+    /// Sidecar object without `metrics` and `metricTypes`.
     ///
-    /// The column names are inserted after the DataFrame exists, so they
-    /// follow the same order as the Parquet file. `_id` is relaxed extended
-    /// JSON (`$date` for the timestamp the server writes). `doc` is the
-    /// embedded collector document, also relaxed extended JSON.
+    /// Those two are filled from the decoded columns, in first-seen order,
+    /// which is the Parquet column order. `metricTypes` names the compressor
+    /// rule (`int`, `double`, `decimal`, `bool`, `date`, `timestampSeconds`,
+    /// `timestampIncrement`). The cell values stay `u64`. `_id` is relaxed
+    /// extended JSON (`$date` for the timestamp the server writes). `doc` is
+    /// the embedded collector document, also relaxed extended JSON.
     pub(crate) fn sidecar_preamble(&self) -> serde_json::Value {
         serde_json::json!({
             "metadata": self.metadata.iter().map(metadata_json).collect::<Vec<_>>(),

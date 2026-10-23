@@ -57,7 +57,7 @@
 //! new or dropped series shows up.
 
 use crate::errors::FileDecoderError;
-use crate::extract::MetricData;
+use crate::extract::{MetricColumn, MetricData, MetricKind};
 use crate::varint::{RangeCursor, unpack};
 use indexmap::IndexMap;
 use std::collections::HashSet;
@@ -244,15 +244,19 @@ pub(crate) fn extract_all_metrics_from_buffer(
     Ok(delta_count + 1)
 }
 
-/// Reconstruct one inflated chunk as `(name, samples)` pairs, in walk order.
+/// Reconstruct one inflated chunk as `(name, kind, samples)` triples, in
+/// walk order.
 ///
-/// The name is the path `extract` built. Nothing is stripped. This function
-/// does not append to a shared map: the caller appends, in chunk order, and
-/// the order of these pairs is the order those names are first recorded.
+/// The name is the path `extract` built. Nothing is stripped. `kind` is
+/// the compressor rule that produced the `u64` bits: int32 and int64 are
+/// both `int`, a timestamp is two columns, and decimal128 is not a double.
+/// This function does not append to a shared map: the caller appends, in
+/// chunk order, and the order of these triples is the order those names
+/// are first recorded.
 pub(crate) fn decode_one_chunk(
     chunk: Vec<u8>,
     keep: &dyn Fn(&str) -> bool,
-) -> Result<(usize, Vec<(String, Vec<u64>)>), FileDecoderError> {
+) -> Result<(usize, Vec<(String, MetricKind, Vec<u64>)>), FileDecoderError> {
     let mut metric_data = crate::extract::extract_metric_meta_data(&chunk)?;
     let height = extract_all_metrics_from_buffer(&mut metric_data, &chunk, keep)?;
 
@@ -260,7 +264,7 @@ pub(crate) fn decode_one_chunk(
     for metric in metric_data {
         let kept = keep(&metric.name);
         match metric.data {
-            Some(samples) if kept => columns.push((metric.name, samples)),
+            Some(samples) if kept => columns.push((metric.name, metric.kind, samples)),
             None if !kept => {}
             _ => {
                 return Err(FileDecoderError::format(format!(
@@ -295,14 +299,14 @@ pub(crate) fn decode_one_chunk(
 /// chunk introduces, in that chunk's field order. Parquet columns follow
 /// this order. A `HashMap` reshuffles them on every run.
 pub(crate) fn append_chunk(
-    merged: &mut IndexMap<String, Vec<Option<u64>>>,
+    merged: &mut IndexMap<String, MetricColumn>,
     rows: &mut usize,
-    columns: Vec<(String, Vec<u64>)>,
+    columns: Vec<(String, MetricKind, Vec<u64>)>,
     height: usize,
 ) -> Result<(), FileDecoderError> {
     let mut present = HashSet::with_capacity(columns.len());
 
-    for (name, samples) in columns {
+    for (name, kind, samples) in columns {
         if samples.len() != height {
             return Err(FileDecoderError::format(format!(
                 "metric '{name}' has {} samples in a chunk whose other metrics have {height}",
@@ -311,12 +315,26 @@ pub(crate) fn append_chunk(
         }
         present.insert(name.clone());
         match merged.get_mut(&name) {
-            Some(existing) => existing.extend(samples.into_iter().map(Some)),
+            Some(existing) => {
+                // The kind is fixed by the chunk that introduced the name.
+                // A later chunk that walks the same path as a different BSON
+                // type would make the sidecar describe every row as the first
+                // kind. The samples are still u64 either way; the mismatch
+                // means the reference documents disagree about the field.
+                if existing.kind != kind {
+                    return Err(FileDecoderError::format(format!(
+                        "metric '{name}' is {} in an earlier chunk and {} in this chunk",
+                        existing.kind.as_str(),
+                        kind.as_str()
+                    )));
+                }
+                existing.values.extend(samples.into_iter().map(Some));
+            }
             None => {
-                let mut series = Vec::with_capacity(*rows + height);
-                series.resize(*rows, None);
-                series.extend(samples.into_iter().map(Some));
-                merged.insert(name, series);
+                let mut values = Vec::with_capacity(*rows + height);
+                values.resize(*rows, None);
+                values.extend(samples.into_iter().map(Some));
+                merged.insert(name, MetricColumn { kind, values });
             }
         }
     }
@@ -324,7 +342,7 @@ pub(crate) fn append_chunk(
     let end = *rows + height;
     for (name, series) in merged.iter_mut() {
         if !present.contains(name) {
-            series.resize(end, None);
+            series.values.resize(end, None);
         }
     }
     *rows = end;
