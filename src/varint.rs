@@ -26,6 +26,10 @@ impl RangeCursor {
             at: 0,
         }
     }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.buffer.len().saturating_sub(self.at)
+    }
 }
 
 /// Read one unsigned LEB128 integer.

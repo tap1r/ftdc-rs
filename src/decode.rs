@@ -35,7 +35,9 @@
 //!
 //! The server refuses a chunk whose `metric_count * sample_count` exceeds
 //! 1_000_000, and an inflated payload larger than 10_000_000 bytes. The
-//! product is checked here, before the sample vectors are allocated.
+//! product is checked before the sample vectors are allocated. The leading
+//! `uint32` of the blob is that inflated length: the zlib output has to
+//! match it, and a larger claim is rejected before inflate.
 //!
 //! `metric_count` is authoritative. The reference walk has to produce that
 //! many metrics. The check happens before any delta is applied, and the
@@ -43,8 +45,10 @@
 //! (an ObjectId counted as a metric, an array element skipped) can be
 //! seen directly.
 //!
-//! Chunks of one file inflate and decode independently. Their columns are
-//! appended afterwards, in file order. A metric that first appears in a
+//! Chunks of one file have no data dependency on each other. This decoder
+//! still inflates and appends them in file order, one at a time: the
+//! compressed blobs in a real archive are tens of kilobytes, and the
+//! sample order is the file order. A metric that first appears in a
 //! later chunk is null for the rows already emitted. A metric that is
 //! absent from a later chunk is null for that chunk's height. Every column
 //! of one chunk has the same height, because one chunk is one rectangle of
@@ -57,28 +61,51 @@ use crate::extract::MetricData;
 use crate::varint::{RangeCursor, unpack};
 use indexmap::IndexMap;
 use std::collections::HashSet;
-use zune_inflate::DeflateDecoder;
+use zune_inflate::{DeflateDecoder, DeflateOptions};
 
 /// The server refuses a chunk whose `metric_count * sample_count` exceeds this.
 const MAX_METRIC_SAMPLES: usize = 1_000_000;
+
+/// The server refuses an inflated metric chunk larger than this.
+///
+/// The blob's first `uint32` is that length. A claim above the cap is
+/// rejected before zlib runs. The decoder's own output cap is the same
+/// number, so a stream that expands past it stops there.
+pub(crate) const MAX_UNCOMPRESSED_CHUNK: usize = 10_000_000;
 
 /// Inflate one metric blob.
 ///
 /// The first four bytes are the uncompressed size the server writes in
 /// front of the zlib stream. A blob shorter than that is not a metric chunk.
-pub(crate) fn inflate_owned(bytes: Vec<u8>) -> Result<Vec<u8>, FileDecoderError> {
+pub(crate) fn inflate_owned(bytes: &[u8]) -> Result<Vec<u8>, FileDecoderError> {
     if bytes.len() < 4 {
         return Err(FileDecoderError::format(format!(
             "metric blob is shorter than the 4-byte uncompressed size"
         )));
     }
-    let mut decoder = DeflateDecoder::new(&bytes[4..]);
-    match decoder.decode_zlib() {
-        Ok(encoded_data) => Ok(encoded_data),
-        Err(error) => Err(FileDecoderError::format(format!(
-            "zlib inflate of an FTDC metric chunk failed: {error}"
-        ))),
+    let declared = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if declared > MAX_UNCOMPRESSED_CHUNK {
+        return Err(FileDecoderError::format(format!(
+            "uncompressed size {declared} exceeds the FTDC limit of {MAX_UNCOMPRESSED_CHUNK}"
+        )));
     }
+    let options = DeflateOptions::default().set_limit(MAX_UNCOMPRESSED_CHUNK);
+    let mut decoder = DeflateDecoder::new_with_options(&bytes[4..], options);
+    let inflated = match decoder.decode_zlib() {
+        Ok(encoded_data) => encoded_data,
+        Err(error) => {
+            return Err(FileDecoderError::format(format!(
+                "zlib inflate of an FTDC metric chunk failed: {error}"
+            )));
+        }
+    };
+    if inflated.len() != declared {
+        return Err(FileDecoderError::format(format!(
+            "uncompressed size {declared} does not match the inflated length {}",
+            inflated.len()
+        )));
+    }
+    Ok(inflated)
 }
 
 /// Read the reference length, `metric_count`, and `sample_count`.
@@ -112,12 +139,14 @@ pub(crate) fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDeco
 
 /// Rebuild every metric in one inflated chunk.
 ///
-/// The returned count is the number of reconstructed sample values
-/// (`metrics * (sample_count + 1)`). Each `MetricData::data` vector has
-/// length `sample_count + 1`.
+/// Returns the chunk height, `sample_count + 1`. Each stored
+/// `MetricData::data` vector has that length. A metric rejected by `keep`
+/// is still advanced through the delta block, and its samples are not
+/// stored. A zero run or a trailing byte past that rectangle is an error.
 pub(crate) fn extract_all_metrics_from_buffer(
     metric_data_vec: &mut Vec<MetricData>,
     buffer: &Vec<u8>,
+    keep: &dyn Fn(&str) -> bool,
 ) -> Result<usize, FileDecoderError> {
     let (doc_size, metric_count, delta_count) = read_header(buffer.as_slice())?;
 
@@ -150,14 +179,20 @@ pub(crate) fn extract_all_metrics_from_buffer(
     }
     let mut data_range_cursor = RangeCursor::new(buffer[offset..].to_vec());
 
-    let mut count = 0;
     // Additional zeros still to emit. This survives from one metric
     // to the next. See the module docs for the `[0, k - 1]` pair.
     let mut zeros_remaining: u64 = 0;
     for metric in metric_data_vec.iter_mut() {
+        let store = keep(&metric.name);
         let mut value = metric.initial;
-        let mut samples = Vec::with_capacity(delta_count + 1);
-        samples.push(value);
+        let mut samples = if store {
+            Vec::with_capacity(delta_count + 1)
+        } else {
+            Vec::new()
+        };
+        if store {
+            samples.push(value);
+        }
 
         for _ in 0..delta_count {
             let delta = if zeros_remaining != 0 {
@@ -175,20 +210,38 @@ pub(crate) fn extract_all_metrics_from_buffer(
             // backwards by one, which is how a value that decreased
             // is encoded. Checked add would fail those samples.
             value = value.wrapping_add(delta);
-            samples.push(value);
-            count += 1;
+            if store {
+                samples.push(value);
+            }
         }
 
         // Length includes the reference sample. Callers that kept
         // only `delta_count` elements dropped the last sample of
         // every chunk, and dropped the only sample of a chunk whose
-        // sample_count was 0.
-        metric.metrics = Some(samples.len());
-        metric.data = Some(samples);
-        count += 1;
+        // sample_count was 0. A filtered-out metric is still walked,
+        // so its deltas are consumed, and then discarded.
+        if store {
+            metric.metrics = Some(samples.len());
+            metric.data = Some(samples);
+        }
     }
 
-    Ok(count)
+    // The rectangle is metric_count columns by delta_count rows. A run
+    // that still has zeros left, or a byte that was not read, is a delta
+    // block that does not match that rectangle.
+    if zeros_remaining != 0 {
+        return Err(FileDecoderError::format(format!(
+            "delta block has {zeros_remaining} zeros past the last sample"
+        )));
+    }
+    if data_range_cursor.remaining() != 0 {
+        return Err(FileDecoderError::format(format!(
+            "delta block has {} trailing bytes",
+            data_range_cursor.remaining()
+        )));
+    }
+
+    Ok(delta_count + 1)
 }
 
 /// Reconstruct one inflated chunk as `(name, samples)` pairs, in walk order.
@@ -198,21 +251,26 @@ pub(crate) fn extract_all_metrics_from_buffer(
 /// the order of these pairs is the order those names are first recorded.
 pub(crate) fn decode_one_chunk(
     chunk: Vec<u8>,
-) -> Result<Vec<(String, Vec<u64>)>, FileDecoderError> {
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<(usize, Vec<(String, Vec<u64>)>), FileDecoderError> {
     let mut metric_data = crate::extract::extract_metric_meta_data(&chunk)?;
-    extract_all_metrics_from_buffer(&mut metric_data, &chunk)?;
+    let height = extract_all_metrics_from_buffer(&mut metric_data, &chunk, keep)?;
 
     let mut columns = Vec::with_capacity(metric_data.len());
     for metric in metric_data {
-        let Some(samples) = metric.data else {
-            return Err(FileDecoderError::format(format!(
-                "metric '{}' produced no samples",
-                metric.name
-            )));
-        };
-        columns.push((metric.name, samples));
+        let kept = keep(&metric.name);
+        match metric.data {
+            Some(samples) if kept => columns.push((metric.name, samples)),
+            None if !kept => {}
+            _ => {
+                return Err(FileDecoderError::format(format!(
+                    "metric '{}' produced no samples",
+                    metric.name
+                )));
+            }
+        }
     }
-    Ok(columns)
+    Ok((height, columns))
 }
 
 /// Append one chunk's columns to the file-level series.
@@ -240,11 +298,8 @@ pub(crate) fn append_chunk(
     merged: &mut IndexMap<String, Vec<Option<u64>>>,
     rows: &mut usize,
     columns: Vec<(String, Vec<u64>)>,
+    height: usize,
 ) -> Result<(), FileDecoderError> {
-    let height = columns
-        .first()
-        .map(|(_, samples)| samples.len())
-        .unwrap_or(0);
     let mut present = HashSet::with_capacity(columns.len());
 
     for (name, samples) in columns {
