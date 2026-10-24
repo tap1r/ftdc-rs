@@ -34,10 +34,12 @@ skipped and reported at `warn` (the default log level). Set `RUST_LOG` to
 raise or quiet that.
 
 `--metadata` writes relaxed extended JSON. `metadata` is every type 0
-document and `metadataDeltas` is every type 2 document, in file order.
-`documentCount` counts every BSON document in the archive.
-`skippedChunkTypes` lists type numbers that were skipped. `metrics` is
-the Parquet column names, in field order.
+wrapper (`_id` and `doc`) and `metadataDeltas` is every type 2 wrapper
+(`_id`, `count`, and `doc`), in file order. `count` is the periodic
+metadata encoder's generation: `0` is a full sample, and a later number
+is a sparse diff. `documentCount` counts every BSON document in the
+archive. `skippedChunkTypes` lists type numbers that were skipped.
+`metrics` is the Parquet column names, in field order.
 
 ## Example
 
