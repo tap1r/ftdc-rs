@@ -56,7 +56,8 @@ use crate::errors::FileDecoderError;
 use crate::extract::MetricData;
 use crate::varint::{RangeCursor, unpack};
 use anyhow::anyhow;
-use std::collections::{HashMap, HashSet};
+use indexmap::IndexMap;
+use std::collections::HashSet;
 use zune_inflate::DeflateDecoder;
 
 /// The server refuses a chunk whose `metric_count * sample_count` exceeds this.
@@ -193,9 +194,9 @@ pub(crate) fn extract_all_metrics_from_buffer(
 
 /// Reconstruct one inflated chunk as `(name, samples)` pairs, in walk order.
 ///
-/// The name still has its leading dot stripped here. Publishing the path
-/// without that dot is a separate change. This function does not append
-/// to a shared map: the caller appends, in chunk order.
+/// The name is the path `extract` built. Nothing is stripped. This function
+/// does not append to a shared map: the caller appends, in chunk order, and
+/// the order of these pairs is the order those names are first recorded.
 pub(crate) fn decode_one_chunk(
     chunk: Vec<u8>,
 ) -> Result<Vec<(String, Vec<u64>)>, FileDecoderError> {
@@ -210,12 +211,7 @@ pub(crate) fn decode_one_chunk(
                 metric.name
             )));
         };
-        let mut name = metric.name;
-        // The walk prefixes every segment with a dot, including the first.
-        if name.starts_with('.') {
-            name.remove(0);
-        }
-        columns.push((name, samples));
+        columns.push((metric.name, samples));
     }
     Ok(columns)
 }
@@ -236,8 +232,13 @@ pub(crate) fn decode_one_chunk(
 /// A name that was in earlier chunks but is absent from this one gets
 /// the same number of trailing nulls. The schema changed the other way:
 /// the metric went away. A zero there would look like the counter reset.
+///
+/// Names stay in the order they were first inserted. That is the reference
+/// document's field order for the first chunk, then any metric a later
+/// chunk introduces, in that chunk's field order. Parquet columns follow
+/// this order. A `HashMap` reshuffles them on every run.
 pub(crate) fn append_chunk(
-    merged: &mut HashMap<String, Vec<Option<u64>>>,
+    merged: &mut IndexMap<String, Vec<Option<u64>>>,
     rows: &mut usize,
     columns: Vec<(String, Vec<u64>)>,
 ) -> Result<(), FileDecoderError> {
