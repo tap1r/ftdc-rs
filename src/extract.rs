@@ -7,7 +7,7 @@
 //!   `u64` each
 //! * `timestamp` — two `u64`s, seconds then increment
 //! * subdocuments — walked, in the order of their fields
-//! * arrays — walked as documents whose keys are `"0"`, `"1"`, ... so an
+//! * arrays — walked element by element. The index is the key, so an
 //!   element's path is `parent.key.<index>.field`
 //!
 //! Strings, ObjectIds, binary, null, regex, JavaScript, symbol, undefined,
@@ -18,12 +18,12 @@
 //! `metric_count` is the length of the server's walk. Deltas are positional,
 //! so a longer walk applies every later delta to the wrong series.
 //!
-//! Decimal128 has no integer accessor in the `bson` crate (it exposes
-//! `Display`: `"42.9"`, `"1.05E+3"`, `"NaN"`, `"Infinity"`). The compressor
-//! calls `BSONElement::numberLong()`, which truncates toward zero and
-//! saturates at the int64 limits. The integer is parsed from that text, and
-//! the int64 bit pattern is the metric. A negative value is therefore a
-//! large unsigned number, which is what a later wrapping delta expects.
+//! Decimal128 is the 16 little-endian IEEE 754-2008 BID bytes. The
+//! compressor calls `BSONElement::numberLong()`, which truncates toward
+//! zero and saturates at the int64 limits. NaN becomes 0. Infinity becomes
+//! `i64::MAX` or `i64::MIN` by sign. The int64 bit pattern is the metric.
+//! A negative value is therefore a large unsigned number, which is what a
+//! later wrapping delta expects. See [`decimal128_to_metric`].
 //!
 //! A double is squeezed into an int64 before that same bit cast. NaN
 //! becomes 0. A value greater than or equal to 2^63, including +Infinity,
@@ -92,33 +92,21 @@ pub(crate) struct MetricData {
     pub(crate) name: String,
     pub(crate) initial: u64,
     pub(crate) kind: MetricKind,
-    /// BSON value this sample was taken from. Kept so a metric_count
-    /// mismatch can say which field disagreed with the compressor.
-    #[allow(dead_code)]
-    pub(crate) metric_type: Bson,
-    pub(crate) metrics: Option<usize>,
     /// Reconstructed samples for one chunk.
     ///
     /// Index 0 is the value taken from the reference document. Each later
     /// index is that value plus the deltas that follow it. The length is
     /// `sample_count + 1`, not `sample_count`: the header counts deltas,
-    /// and the reference document is itself a sample.
+    /// and the reference document is itself a sample. `None` means the
+    /// caller rejected the name; the deltas were still consumed.
     pub(crate) data: Option<Vec<u64>>,
 }
 
-pub(crate) fn push_metric(
-    name: &str,
-    initial: u64,
-    kind: MetricKind,
-    metric_type: Bson,
-    out: &mut Vec<MetricData>,
-) {
+pub(crate) fn push_metric(name: &str, initial: u64, kind: MetricKind, out: &mut Vec<MetricData>) {
     out.push(MetricData {
         name: name.to_string(),
         initial,
         kind,
-        metric_type,
-        metrics: None,
         data: None,
     });
 }
@@ -129,10 +117,100 @@ pub(crate) fn push_metric(
 /// `numberLong()`, and `Decimal128::toLong()` truncates toward zero and
 /// saturates at the int64 limits. NaN becomes 0. The int64 bit pattern
 /// is then stored as the uint64 metric.
+///
+/// The 16 bytes are IEEE 754-2008 binary integer decimal, stored by BSON
+/// in the opposite byte order from the spec. `u128::from_le_bytes` puts
+/// the sign in bit 127. Bits 1 through 4 of that spec order, all set,
+/// mark a special: bit 5 set is NaN, otherwise Infinity. A finite value
+/// whose combination field starts with `11` carries a 14-bit exponent
+/// from bit 3 and a coefficient prefixed by `100`. Otherwise the exponent
+/// starts at bit 1 and the coefficient prefix is `0`. The exponent bias
+/// is 6176. The coefficient is at most 34 digits. The metric is
+/// `coefficient * 10^exponent`, truncated toward zero.
 pub(crate) fn decimal128_to_metric(value: &bson::Decimal128) -> u64 {
-    decimal_text_to_i64(&value.to_string()) as u64
+    decimal128_bits_to_i64(value.bytes()) as u64
 }
 
+/// `index` counts from the high bit of `bits`, which is spec bit 0.
+fn decimal_bit(bits: u128, index: usize) -> bool {
+    (bits >> (127 - index)) & 1 == 1
+}
+
+fn decimal_field(bits: u128, start: usize, len: usize) -> u128 {
+    let shift = 128 - start - len;
+    (bits >> shift) & ((1u128 << len) - 1)
+}
+
+fn decimal128_bits_to_i64(bytes: [u8; 16]) -> i64 {
+    let bits = u128::from_le_bytes(bytes);
+    let negative = decimal_bit(bits, 0);
+    // Bits 1..=4 all set: NaN or Infinity. A finite coefficient never
+    // uses that combination.
+    if decimal_field(bits, 1, 4) == 0b1111 {
+        if decimal_bit(bits, 5) {
+            return 0;
+        }
+        return if negative { i64::MIN } else { i64::MAX };
+    }
+
+    let (exponent_at, prefix) = if decimal_field(bits, 1, 2) == 0b11 {
+        (3, 0b100u128)
+    } else {
+        (1, 0u128)
+    };
+    let exponent = decimal_field(bits, exponent_at, 14) as i32 - 6176;
+    let suffix_at = exponent_at + 14;
+    let suffix_len = 128 - suffix_at;
+    let suffix = decimal_field(bits, suffix_at, suffix_len);
+    let mut coefficient = (prefix << suffix_len) | suffix;
+    // 34 digits is the format maximum. A wider coefficient is not a
+    // number; the parser treats it as zero rather than saturating.
+    const MAX_COEFFICIENT: u128 = 9_999_999_999_999_999_999_999_999_999_999_999;
+    if coefficient > MAX_COEFFICIENT {
+        coefficient = 0;
+    }
+    scale_decimal(coefficient, exponent, negative)
+}
+
+/// `coefficient * 10^exponent`, truncated toward zero, saturated at the
+/// int64 limits. A negative zero stays zero.
+fn scale_decimal(mut magnitude: u128, exponent: i32, negative: bool) -> i64 {
+    if magnitude == 0 {
+        return 0;
+    }
+    if exponent >= 0 {
+        for _ in 0..exponent {
+            if magnitude > (i64::MAX as u128) / 10 {
+                return if negative { i64::MIN } else { i64::MAX };
+            }
+            magnitude *= 10;
+        }
+    } else {
+        for _ in 0..(-exponent) {
+            magnitude /= 10;
+            if magnitude == 0 {
+                return 0;
+            }
+        }
+    }
+    if magnitude > i64::MAX as u128 {
+        return if negative { i64::MIN } else { i64::MAX };
+    }
+    let magnitude = magnitude as u64;
+    if !negative {
+        magnitude as i64
+    } else if magnitude > i64::MAX as u64 {
+        i64::MIN
+    } else {
+        -(magnitude as i64)
+    }
+}
+
+/// The `Display` round-trip this decoder used to apply to Decimal128.
+///
+/// Kept so a test can check the bit walk against the strings `"42.9"`,
+/// `"1.05E+3"`, `"NaN"`, and `"Infinity"`. The decoder does not call it.
+#[cfg(test)]
 pub(crate) fn decimal_text_to_i64(text: &str) -> i64 {
     match text {
         "NaN" | "nan" | "NAN" => return 0,
@@ -255,80 +333,70 @@ pub(crate) fn extract_metric_data_from_doc(
 ) {
     for (key, value) in root {
         let path = metric_path(doc_name, &key);
-        match value {
-            Bson::Double(v) => {
-                push_metric(
-                    &path,
-                    double_to_metric(v),
-                    MetricKind::Double,
-                    value,
-                    metric_data,
-                );
-            }
-            Bson::Int32(v) => push_metric(&path, v as u64, MetricKind::Int, value, metric_data),
-            Bson::Int64(v) => push_metric(&path, v as u64, MetricKind::Int, value, metric_data),
-            Bson::Decimal128(v) => {
-                // `BSONElement::numberLong()` for NumberDecimal, which is
-                // what the compressor calls. One uint64, not a sentinel.
-                // The sentinel 999999999 used to be the base every delta
-                // in this column was added to.
-                push_metric(
-                    &path,
-                    decimal128_to_metric(&v),
-                    MetricKind::Decimal,
-                    value,
-                    metric_data,
-                );
-            }
-            Bson::Boolean(v) => {
-                push_metric(&path, u64::from(v), MetricKind::Bool, value, metric_data)
-            }
-            Bson::DateTime(v) => {
-                push_metric(
-                    &path,
-                    v.timestamp_millis() as u64,
-                    MetricKind::Date,
-                    value,
-                    metric_data,
-                );
-            }
-            Bson::Timestamp(v) => {
-                // Two metrics, seconds then increment. The names gain a
-                // suffix so the two columns can be told apart; the order
-                // is the order the compressor pushes them.
-                push_metric(
-                    &format!("{path}_time"),
-                    u64::from(v.time),
-                    MetricKind::TimestampSeconds,
-                    value.clone(),
-                    metric_data,
-                );
-                push_metric(
-                    &format!("{path}_increment"),
-                    u64::from(v.increment),
-                    MetricKind::TimestampIncrement,
-                    value,
-                    metric_data,
-                );
-            }
-            Bson::Document(sub_doc) => {
-                extract_metric_data_from_doc(&path, sub_doc, metric_data);
-            }
-            Bson::Array(items) => {
-                for (index, item) in items.into_iter().enumerate() {
-                    // Re-enter through the same match by wrapping the
-                    // element in a one-field document whose key is the
-                    // index. That keeps array elements and document
-                    // fields on one path.
-                    let mut wrapper = Document::new();
-                    wrapper.insert(index.to_string(), item);
-                    extract_metric_data_from_doc(&path, wrapper, metric_data);
-                }
-            }
-            // String, ObjectId, Null, Binary, Regex, JavaScript, Symbol,
-            // Undefined, MinKey, MaxKey, DBPointer. Not metrics.
-            _ => {}
+        walk_value(&path, value, metric_data);
+    }
+}
+
+/// One BSON value in the reference walk.
+///
+/// A document walks its fields. An array walks its elements with the
+/// decimal index as the key (`members.0`, `members.1`). The element is
+/// the value itself: a scalar is a metric, a document is walked, and a
+/// nested array continues. Wrapping the element in a one-field document
+/// built the same path and allocated a document per element to do it.
+fn walk_value(path: &str, value: Bson, metric_data: &mut Vec<MetricData>) {
+    match value {
+        Bson::Double(v) => push_metric(path, double_to_metric(v), MetricKind::Double, metric_data),
+        Bson::Int32(v) => push_metric(path, v as u64, MetricKind::Int, metric_data),
+        Bson::Int64(v) => push_metric(path, v as u64, MetricKind::Int, metric_data),
+        Bson::Decimal128(v) => {
+            // `BSONElement::numberLong()` for NumberDecimal, which is
+            // what the compressor calls. One uint64, not a sentinel.
+            // The sentinel 999999999 used to be the base every delta
+            // in this column was added to.
+            push_metric(
+                path,
+                decimal128_to_metric(&v),
+                MetricKind::Decimal,
+                metric_data,
+            );
         }
+        Bson::Boolean(v) => push_metric(path, u64::from(v), MetricKind::Bool, metric_data),
+        Bson::DateTime(v) => {
+            push_metric(
+                path,
+                v.timestamp_millis() as u64,
+                MetricKind::Date,
+                metric_data,
+            );
+        }
+        Bson::Timestamp(v) => {
+            // Two metrics, seconds then increment. The names gain a
+            // suffix so the two columns can be told apart; the order
+            // is the order the compressor pushes them.
+            push_metric(
+                &format!("{path}_time"),
+                u64::from(v.time),
+                MetricKind::TimestampSeconds,
+                metric_data,
+            );
+            push_metric(
+                &format!("{path}_increment"),
+                u64::from(v.increment),
+                MetricKind::TimestampIncrement,
+                metric_data,
+            );
+        }
+        Bson::Document(sub_doc) => extract_metric_data_from_doc(path, sub_doc, metric_data),
+        Bson::Array(items) => {
+            for (index, item) in items.into_iter().enumerate() {
+                let child = metric_path(path, &index.to_string());
+                walk_value(&child, item, metric_data);
+            }
+        }
+        // String, ObjectId, Null, Binary, Regex, JavaScript, Symbol,
+        // Undefined, MinKey, MaxKey, DBPointer. Not metrics.
+        _ => {}
     }
 }
 
@@ -337,10 +405,8 @@ pub(crate) fn extract_metric_data_from_doc(
 /// The reference document is a BSON document, so its own first four bytes
 /// are its length. Bytes after that document are the chunk header and the
 /// deltas; `Document::from_reader` stops at the end of the document.
-pub(crate) fn extract_metric_meta_data(
-    buffer: &Vec<u8>,
-) -> Result<Vec<MetricData>, FileDecoderError> {
-    let mut base = buffer.as_slice();
+pub(crate) fn extract_metric_meta_data(buffer: &[u8]) -> Result<Vec<MetricData>, FileDecoderError> {
+    let mut base = buffer;
 
     match Document::from_reader(&mut base) {
         Ok(bson_doc) => {

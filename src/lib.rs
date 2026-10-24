@@ -346,11 +346,39 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(super::decimal_text_to_i64("1.05E+3"), 1050);
-        assert_eq!(super::decimal_text_to_i64("-3.2"), -3);
-        assert_eq!(super::decimal_text_to_i64("NaN"), 0);
-        assert_eq!(super::decimal_text_to_i64("Infinity"), i64::MAX);
-        assert_eq!(super::decimal_text_to_i64("-Infinity"), i64::MIN);
+        // The text parser is the old `Display` round-trip. The decoder now
+        // reads the 16 IEEE bits. Both have to agree with `numberLong`.
+        for (text, expected) in [
+            ("42.9", 42i64),
+            ("-3.2", -3),
+            ("1.05E+3", 1050),
+            ("0.5", 0),
+            ("NaN", 0),
+            ("Infinity", i64::MAX),
+            ("-Infinity", i64::MIN),
+            ("1E+20", i64::MAX),
+        ] {
+            assert_eq!(super::decimal_text_to_i64(text), expected, "{text}");
+            let parsed: bson::Decimal128 = text.parse().unwrap();
+            assert_eq!(
+                crate::extract::decimal128_to_metric(&parsed),
+                expected as u64,
+                "{text}"
+            );
+        }
+
+        let scalars = bson::doc! { "ns": [1i32, 2i32] };
+        let path = write_one_chunk(&scalars, 2, 0, &[]);
+        let series = open_decoded(&path);
+        assert_eq!(
+            series.get("ns.0").map(|column| column.values.as_slice()),
+            Some([Some(1)].as_slice())
+        );
+        assert_eq!(
+            series.get("ns.1").map(|column| column.values.as_slice()),
+            Some([Some(2)].as_slice())
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Two chunks must concatenate in file order, and a chunk whose
@@ -932,7 +960,8 @@ mod tests {
         assert!(err.to_string().contains("end"), "{err}");
         let _ = std::fs::remove_file(&short);
 
-        let mut wide = crate::varint::RangeCursor::new(vec![0x80; 11]);
+        let wide_bytes = [0x80u8; 11];
+        let mut wide = crate::varint::RangeCursor::new(&wide_bytes);
         let err = crate::varint::unpack(&mut wide).unwrap_err();
         assert!(err.to_string().contains("64"), "{err}");
     }
