@@ -14,12 +14,50 @@ use std::thread;
 use zune_inflate::DeflateDecoder;
 use zune_inflate::errors::{DecodeErrorStatus, InflateDecodeErrors};
 
-/// A struct that de codes an FTDC file.
-/// The parsed data should be encapsulated in another struct.
+/// `type` values on the BSON documents concatenated inside an FTDC archive.
+///
+/// An archive (`metrics.<utc>-<uniquifier>`, or `metrics.interim`) is not one
+/// BSON document. It is a sequence of them. `bsondump` shows each one. The
+/// `type` field says which kind of payload follows:
+///
+/// * `0` — metadata, written when the file is opened. The payload is `doc`
+///   and describes the host and the collectors. There is normally one.
+/// * `1` — a metric chunk. The payload is `data`, a BinData blob: a `uint32`
+///   uncompressed length, then a zlib stream of deltas. This is the only
+///   type that carries the time series.
+/// * `2` — a periodic metadata delta. MongoDB 7 and later write these for
+///   slow-changing values such as server parameters. The payload is `doc`
+///   plus a `count`. A metrics file usually has one of these *before* the
+///   first metric chunk. They are not samples and they are not a reason to
+///   stop reading.
+///
+/// The server has grown this set before (`2` itself was the addition). A
+/// type this build does not know is skipped and remembered, so metric chunks
+/// that follow it are still decoded.
+const TYPE_METADATA: i32 = 0;
+const TYPE_METRIC_CHUNK: i32 = 1;
+const TYPE_METADATA_DELTA: i32 = 2;
+
+/// A struct that decodes an FTDC file.
+///
+/// The compressed metric blobs live here until [`FTDCFileDecoder::uncompress_data`]
+/// inflates them. Metadata documents are kept whole so a later export can
+/// write them as JSON without parsing `Document`'s `Display` text back apart.
 pub struct FTDCFileDecoder {
-    metadata: String,
-    parameters: String,
-    metric_chunks_count: usize,
+    /// Type 0 `doc` sub-documents, in file order.
+    metadata_docs: Vec<Document>,
+    /// Type 2 `doc` sub-documents, in file order.
+    ///
+    /// The old field name for this was `parameters`. Type 2 is a metadata
+    /// delta, not the startup parameter block. Several of them can appear
+    /// in one file; keeping only the last one drops the earlier samples.
+    metadata_deltas: Vec<Document>,
+    /// BSON documents visited while reading, of every type, including
+    /// types that were skipped.
+    document_count: usize,
+    /// `type` numbers this build did not recognise. Reading continued.
+    skipped_chunk_types: Vec<i32>,
+    /// Type 1 `data` blobs, still compressed, in file order.
     binary_chunks: Vec<Binary>,
 }
 
@@ -27,9 +65,18 @@ pub struct FTDCFileDecoder {
 struct MetricData {
     name: String,
     initial: u64,
+    /// BSON value this sample was taken from. Kept so a metric_count
+    /// mismatch can say which field disagreed with the compressor.
+    #[allow(dead_code)]
     metric_type: Bson,
     metrics: Option<usize>,
-    data: Option<[u64; FTDCFileDecoder::MAX_METRICS]>,
+    /// Reconstructed samples for one chunk.
+    ///
+    /// Index 0 is the value taken from the reference document. Each later
+    /// index is that value plus the deltas that follow it. The length is
+    /// `sample_count + 1`, not `sample_count`: the header counts deltas,
+    /// and the reference document is itself a sample.
+    data: Option<Vec<u64>>,
 }
 
 struct RangeCursor {
@@ -38,55 +85,179 @@ struct RangeCursor {
     at: usize,
 }
 
-/// Unpacks varint deltas
+/// Read one unsigned LEB128 integer from the delta block.
 ///
-/// # Arguments
-///
-/// * `data_range_cursor` - A structure that holds the decompressed deltas.
-fn unpack(data_range_cursor: &mut RangeCursor) -> u64 {
+/// FTDC uses the same 7-bit grouping as the S2 varint: the low 7 bits
+/// are payload, and the high bit says another byte follows. A zero is a
+/// real value (it starts a run of zeros). Running off the end of the
+/// buffer used to return 0 as well, so a short chunk was decoded as a
+/// run of quiet zeros instead of a broken file.
+fn unpack(data_range_cursor: &mut RangeCursor) -> Result<u64, FileDecoderError> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
 
     loop {
-        if data_range_cursor.at >= data_range_cursor._size {
-            break;
+        if data_range_cursor.at >= data_range_cursor.buffer.len() {
+            return Err(FileDecoderError::Other(anyhow!(
+                "FTDC varint ran past the end of the delta block"
+            )));
+        }
+        // A u64 has room for 10 payload bytes (9 * 7 + 1). One more byte
+        // would shift by 70 and panic, and it cannot be a legal value.
+        if shift >= 64 {
+            return Err(FileDecoderError::Other(anyhow!(
+                "FTDC varint is wider than 64 bits"
+            )));
         }
         let b = data_range_cursor.buffer[data_range_cursor.at];
         data_range_cursor.at += 1;
 
-        result |= ((b & 0x07f) as u64) << shift;
-        shift += 7;
+        result |= u64::from(b & 0x7f) << shift;
         if (b & 0x80) == 0 {
-            return result;
+            return Ok(result);
         }
+        shift += 7;
+    }
+}
+
+fn push_metric(name: &str, initial: u64, metric_type: Bson, out: &mut Vec<MetricData>) {
+    out.push(MetricData {
+        name: name.to_string(),
+        initial,
+        metric_type,
+        metrics: None,
+        data: None,
+    });
+}
+
+/// Convert a Decimal128 the way `BSONElement::numberLong()` does.
+///
+/// The compressor does not have a special case for decimal. It calls
+/// `numberLong()`, and `Decimal128::toLong()` truncates toward zero and
+/// saturates at the int64 limits. NaN becomes 0. The int64 bit pattern
+/// is then stored as the uint64 metric, so a negative value is a large
+/// unsigned number, which is what a later wrapping delta expects.
+///
+/// The `bson` crate exposes Decimal128 as text (`"42.9"`, `"1.05E+3"`,
+/// `"NaN"`, `"Infinity"`). The integer is taken from that text.
+fn decimal128_to_metric(value: &bson::Decimal128) -> u64 {
+    decimal_text_to_i64(&value.to_string()) as u64
+}
+
+fn decimal_text_to_i64(text: &str) -> i64 {
+    match text {
+        "NaN" | "nan" | "NAN" => return 0,
+        "Infinity" | "+Infinity" => return i64::MAX,
+        "-Infinity" => return i64::MIN,
+        _ => {}
     }
 
-    0
+    let negative = text.starts_with('-');
+    let body = text.trim_start_matches(['+', '-']);
+    let (coeff, exponent) = match body.split_once(['e', 'E']) {
+        Some((coeff, exp)) => match exp.parse::<i32>() {
+            Ok(exp) => (coeff, exp),
+            Err(_) => return 0,
+        },
+        None => (body, 0),
+    };
+    let (int_digits, frac_digits) = match coeff.split_once('.') {
+        Some((int_digits, frac_digits)) => (int_digits, frac_digits),
+        None => (coeff, ""),
+    };
+    if int_digits.is_empty()
+        || !int_digits.bytes().all(|b| b.is_ascii_digit())
+        || !frac_digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return 0;
+    }
+
+    let digits = format!("{int_digits}{frac_digits}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return 0;
+    }
+
+    // scale is the power of ten that turns the digit string into the
+    // integer part. A negative scale means "drop digits", which is the
+    // truncation toward zero.
+    let scale = exponent - frac_digits.len() as i32;
+    let mut magnitude = digits.to_string();
+    if scale >= 0 {
+        magnitude.extend(std::iter::repeat('0').take(scale as usize));
+    } else {
+        let drop = (-scale) as usize;
+        if drop >= magnitude.len() {
+            return 0;
+        }
+        magnitude.truncate(magnitude.len() - drop);
+    }
+
+    let parsed = match magnitude.parse::<u64>() {
+        Ok(value) => value,
+        // More digits than a u64. The int64 range is smaller still.
+        Err(_) => return if negative { i64::MIN } else { i64::MAX },
+    };
+    if !negative {
+        if parsed > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            parsed as i64
+        }
+    } else if parsed > i64::MAX as u64 {
+        i64::MIN
+    } else {
+        -(parsed as i64)
+    }
 }
 
 impl FTDCFileDecoder {
-    const METADATA: i32 = 0;
-    const METRICS: i32 = 1;
-    const PARAMETERS: i32 = 2;
-    pub const MAX_METRICS: usize = 300;
-
     pub const INITIAL_METRIC_CAPACITY: usize = 10240;
 
-    /// Reads the info on the header of a decompressed data chunk.
-    /// This is not very reliable for metric_count.
-    fn read_header(data: &[u8]) -> (usize, usize, usize) {
-        //  as *const u32;
-        let data_size = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    /// The server refuses a chunk whose `metric_count * sample_count`
+    /// exceeds this. A corrupt header that asks for more than that is
+    /// rejected here so we do not allocate it.
+    const MAX_METRIC_SAMPLES: usize = 1_000_000;
 
-        let offset: usize = data_size as usize;
-        let metric_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-        let delta_count = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
-
-        (
-            data_size as usize,
-            metric_count as usize,
-            delta_count as usize,
-        )
+    /// Read the three words that precede the delta block.
+    ///
+    /// Layout of an inflated metric chunk, after the 4-byte uncompressed
+    /// size and the zlib wrapper have been removed:
+    ///
+    /// ```text
+    /// reference document   BSON, whose own first 4 bytes are its length
+    /// metric_count         uint32   how many numbers were extracted
+    /// sample_count         uint32   how many *deltas* follow, per metric
+    /// deltas               varints
+    /// ```
+    ///
+    /// `sample_count` does not include the reference document. The server
+    /// decompressor returns `1 + sample_count` samples: the reference,
+    /// then one reconstructed document per delta. A chunk that only holds
+    /// the reference (common at the start of a file) has `sample_count`
+    /// 0 and still has one sample.
+    fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDecoderError> {
+        if data.len() < 4 {
+            return Err(FileDecoderError::Other(anyhow!(
+                "inflated metric chunk is shorter than a BSON length"
+            )));
+        }
+        let data_size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        if data_size < 5 || data.len() < data_size.saturating_add(8) {
+            return Err(FileDecoderError::Other(anyhow!(
+                "inflated metric chunk does not contain metric_count and sample_count"
+            )));
+        }
+        let metric_count =
+            u32::from_le_bytes(data[data_size..data_size + 4].try_into().unwrap()) as usize;
+        let sample_count =
+            u32::from_le_bytes(data[data_size + 4..data_size + 8].try_into().unwrap()) as usize;
+        if metric_count.saturating_mul(sample_count) > Self::MAX_METRIC_SAMPLES {
+            return Err(FileDecoderError::Other(anyhow!(
+                "metric_count {metric_count} and sample_count {sample_count} exceed the FTDC limit"
+            )));
+        }
+        Ok((data_size, metric_count, sample_count))
     }
 
     /// Inflates/uncompressed a zipped blob.
@@ -152,131 +323,94 @@ impl FTDCFileDecoder {
         Ok(uncompressed_data_vector.lock().unwrap().clone())
     }
 
-    /// Reads sub-docs from the original BSON doc recursively.
-    ///  Auxiliar to `extract_metric_meta_data`
+    /// Walk a reference document in field order and record one metric per
+    /// number the server compressor would have extracted.
     ///
-    /// # Arguments:
-    /// * `doc_name` - A str reference with the name of the parent BSON document.
-    /// * `metric_data` - A mutable reference to a Vector of MetricData
+    /// `FTDCBSONUtil::isFTDCType` is the list. Everything else is skipped,
+    /// not turned into a number:
     ///
-    /// # Returns
-    /// * Metric data structures are appended/pushed into the `metric_data` vector.
+    /// * `double`, `int32`, `int64`, `decimal128`, `bool`, `datetime` — one
+    ///   `uint64` each
+    /// * `timestamp` — two `uint64`s, seconds then increment
+    /// * subdocuments and arrays — walked, not themselves a metric
+    ///
+    /// Strings, ObjectIds, binary, null, and the other BSON types are not
+    /// on that list. `serverStatus.repl.topologyVersion.processId` and
+    /// `electionId` are ObjectIds. Counting either of them makes this walk
+    /// longer than `metric_count` in the chunk header, and every delta
+    /// after that point is applied to the wrong series.
+    ///
+    /// An array is a BSON document whose keys are `"0"`, `"1"`, ... so the
+    /// path of an element is `parent.key.<index>`, the same way a nested
+    /// document appends its field name. Numeric elements of an array are
+    /// metrics. Skipping them (and only descending into subdocuments)
+    /// shortens the walk by the same amount.
+    ///
+    /// `doc_name` is the path so far, with a leading dot on every segment
+    /// including the first. Callers strip that first character when they
+    /// publish the name. The dot is a historical accident of starting from
+    /// an empty parent; the path cleanup removes it.
     fn extract_metric_data_from_doc(
         doc_name: &str,
         root: Document,
         metric_data: &mut Vec<MetricData>,
     ) {
-        for (k, doc) in root {
-            match doc {
+        for (key, value) in root {
+            let path = format!("{doc_name}.{key}");
+            match value {
                 Bson::Double(v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}", k.to_string()),
-                        initial: v as u64,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
+                    // Range reduction to int64 is applied in a later change.
+                    // `as u64` is not what the compressor stored for NaN,
+                    // negatives, or values past 2^63.
+                    push_metric(&path, v as u64, value, metric_data);
                 }
-                Bson::String(_) => {}
-                Bson::Array(arr) => {
-                    let mut i = 0;
-                    for a in arr {
-                        let n = format!("{doc_name}.{}.{}", i, k.to_string());
-
-                        match a {
-                            Bson::Document(doc) => {
-                                FTDCFileDecoder::extract_metric_data_from_doc(&n, doc, metric_data);
-                            }
-                            _ => {}
-                        }
-
-                        i += 1;
-                    }
+                Bson::Int32(v) => push_metric(&path, v as u64, value, metric_data),
+                Bson::Int64(v) => push_metric(&path, v as u64, value, metric_data),
+                Bson::Decimal128(v) => {
+                    // `BSONElement::numberLong()` for NumberDecimal, which is
+                    // what the compressor calls. One uint64, not a sentinel.
+                    // The sentinel 999999999 used to be the base every delta
+                    // in this column was added to.
+                    push_metric(&path, decimal128_to_metric(&v), value, metric_data);
                 }
-                Bson::Document(sub_doc) => {
-                    let n = format!("{doc_name}.{}", k.to_string());
-                    FTDCFileDecoder::extract_metric_data_from_doc(&n, sub_doc, metric_data);
-                }
-                Bson::Boolean(v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}", k.to_string()),
-                        initial: v as u64,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
-                }
-                Bson::Null => {}
-                Bson::RegularExpression(_) => {}
-                Bson::JavaScriptCode(_) => {}
-                Bson::JavaScriptCodeWithScope(_) => {}
-                Bson::Int32(v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}", k.to_string()),
-                        initial: v as u64,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
-                }
-                Bson::Int64(v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}", k.to_string()),
-                        initial: v as u64,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
+                Bson::Boolean(v) => push_metric(&path, u64::from(v), value, metric_data),
+                Bson::DateTime(v) => {
+                    push_metric(&path, v.timestamp_millis() as u64, value, metric_data);
                 }
                 Bson::Timestamp(v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}_time", k.to_string()),
-                        initial: v.time as u64,
-                        metric_type: doc.clone(),
-                        metrics: None,
-                        data: None,
-                    });
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}_increment", k.to_string()),
-                        initial: v.increment as u64,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
+                    // Two metrics, seconds then increment. The names gain a
+                    // suffix so the two columns can be told apart; the order
+                    // is the order the compressor pushes them.
+                    push_metric(
+                        &format!("{path}_time"),
+                        u64::from(v.time),
+                        value.clone(),
+                        metric_data,
+                    );
+                    push_metric(
+                        &format!("{path}_increment"),
+                        u64::from(v.increment),
+                        value,
+                        metric_data,
+                    );
                 }
-                Bson::Binary(_) => {}
-                Bson::ObjectId(v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}", k.to_string()),
-                        initial: v.timestamp().timestamp_millis() as u64,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
+                Bson::Document(sub_doc) => {
+                    FTDCFileDecoder::extract_metric_data_from_doc(&path, sub_doc, metric_data);
                 }
-                Bson::DateTime(v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}", k.to_string()),
-                        initial: v.timestamp_millis() as u64,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
+                Bson::Array(items) => {
+                    for (index, item) in items.into_iter().enumerate() {
+                        // Re-enter through the same match by wrapping the
+                        // element in a one-field document whose key is the
+                        // index. That keeps array elements and document
+                        // fields on one path.
+                        let mut wrapper = Document::new();
+                        wrapper.insert(index.to_string(), item);
+                        FTDCFileDecoder::extract_metric_data_from_doc(&path, wrapper, metric_data);
+                    }
                 }
-                Bson::Symbol(_) => {}
-                Bson::Decimal128(_v) => {
-                    metric_data.push(MetricData {
-                        name: format!("{doc_name}.{}", k.to_string()),
-                        initial: 999999999,
-                        metric_type: doc,
-                        metrics: None,
-                        data: None,
-                    });
-                }
-                Bson::Undefined => {}
-                Bson::MaxKey => {}
-                Bson::MinKey => {}
-                Bson::DbPointer(_) => {}
+                // String, ObjectId, Null, Binary, Regex, JavaScript, Symbol,
+                // Undefined, MinKey, MaxKey, DBPointer. Not metrics.
+                _ => {}
             }
         }
     }
@@ -308,71 +442,100 @@ impl FTDCFileDecoder {
         }
     }
 
-    /// Extract metric values from decompressed Metric data as varint deltas added to an initial value.
+    /// Rebuild every metric in one inflated chunk.
     ///
-    /// # Arguments
+    /// The delta block is column-major: every delta of metric 0, then
+    /// every delta of metric 1, and so on. A delta is added to the
+    /// previous sample with wrapping `uint64` arithmetic, which is what
+    /// the C++ compressor does (`uint64_t` addition). The reference
+    /// value is sample 0 and is not itself stored as a delta.
     ///
-    /// * - `metric_data_vec` -  A vector of MetricData where the uncompressed data is.
+    /// Zeros are run-length encoded across that whole block, including
+    /// across the boundary between two metrics. A run of *k* zeros is
+    /// stored as the pair `[0, k - 1]`: the `0` is the first zero, and
+    /// the next varint is how many further zeros follow. The count is
+    /// shared across metrics on purpose. Resetting it at each metric
+    /// would swallow the run that the compressor wrote as one pair.
     ///
-    /// # Returns
-    ///
-    ///  A count of how many values were found. The actual values are stored in the `metric_data_vec`
-    fn extract_all_metrics_from_buffer<'a>(
+    /// The returned count is the number of reconstructed sample values
+    /// (`metrics * (sample_count + 1)`). Each `MetricData::data` vector
+    /// has length `sample_count + 1`.
+    fn extract_all_metrics_from_buffer(
         metric_data_vec: &mut Vec<MetricData>,
         buffer: &Vec<u8>,
     ) -> Result<usize, FileDecoderError> {
-        let (doc_size, _, delta_count_from_header) =
-            FTDCFileDecoder::read_header(buffer.as_slice());
+        let (doc_size, metric_count, delta_count) =
+            FTDCFileDecoder::read_header(buffer.as_slice())?;
+
+        // The delta block has no names. Column i of the block belongs to
+        // metric i of this walk. The server checks the same equality and
+        // refuses the chunk when it fails. Doing it here, before any
+        // addition, means a bad walk cannot silently shift the series.
+        if metric_data_vec.len() != metric_count {
+            let first = metric_data_vec
+                .first()
+                .map(|metric| metric.name.as_str())
+                .unwrap_or("(none)");
+            let last = metric_data_vec
+                .last()
+                .map(|metric| metric.name.as_str())
+                .unwrap_or("(none)");
+            return Err(FileDecoderError::Other(anyhow!(
+                "extracted {} metrics from the reference document, but the chunk header says {metric_count}. \
+                 Deltas are positional, so these lengths have to match or every later series is built from the wrong column. \
+                 First extracted name is '{first}', last is '{last}'.",
+                metric_data_vec.len()
+            )));
+        }
 
         let offset = doc_size + 8;
-        let data_range_size = buffer.len() - offset;
-
-        let q = buffer.as_slice()[offset..].to_vec();
+        if offset > buffer.len() {
+            return Err(FileDecoderError::Other(anyhow!(
+                "metric chunk header points past the end of the inflated buffer"
+            )));
+        }
         let mut data_range_cursor = RangeCursor {
-            buffer: q,
-            _size: data_range_size,
+            buffer: buffer[offset..].to_vec(),
+            _size: buffer.len() - offset,
             at: 0,
         };
 
         let mut count = 0;
-        let mut num_zeroes: u32 = 0;
-        for m in 0..metric_data_vec.len() {
-            let mut unpacked_value = metric_data_vec.get(m).unwrap().initial;
+        // Additional zeros still to emit. This survives from one metric
+        // to the next. See the comment on this function.
+        let mut zeros_remaining: u64 = 0;
+        for metric in metric_data_vec.iter_mut() {
+            let mut value = metric.initial;
+            let mut samples = Vec::with_capacity(delta_count + 1);
+            samples.push(value);
 
-            let _name = &metric_data_vec.get(m).unwrap().name;
-            let _type = &metric_data_vec.get(m).unwrap().metric_type;
-            //println!("{m}: name = {_name}  type ={_type:?}");
+            for _ in 0..delta_count {
+                let delta = if zeros_remaining != 0 {
+                    zeros_remaining -= 1;
+                    0
+                } else {
+                    let decoded = unpack(&mut data_range_cursor)?;
+                    if decoded == 0 {
+                        zeros_remaining = unpack(&mut data_range_cursor)?;
+                    }
+                    decoded
+                };
 
-            let mut metric_values = [0u64; FTDCFileDecoder::MAX_METRICS];
-            metric_values[0] = unpacked_value;
-            for s in 1..FTDCFileDecoder::MAX_METRICS {
-                metric_values[s] = 0;
+                // Wrapping add. A delta of u64::MAX takes a counter
+                // backwards by one, which is how a value that decreased
+                // is encoded. Checked add would fail those samples.
+                value = value.wrapping_add(delta);
+                samples.push(value);
+                count += 1;
             }
 
-            for s in 0..delta_count_from_header {
-                let delta: u64;
-                if num_zeroes != 0 {
-                    delta = 0;
-                    num_zeroes -= 1;
-                } else {
-                    delta = unpack(&mut data_range_cursor);
-                    if delta == 0 {
-                        num_zeroes = unpack(&mut data_range_cursor) as u32;
-                    }
-                }
-
-                // Handling overflow on the cheap. The following line works in C++
-                // unpacked_value += delta;
-                // when  112 + 18446744073709551615
-                unpacked_value = (u128::from(unpacked_value) + u128::from(delta)) as u64;
-                // But Rust is aware of overflow.
-                metric_values[s + 1] = unpacked_value;
-
-                count += 1;
-            } //
-
-            metric_data_vec.get_mut(m).unwrap().data = Option::from(metric_values);
-            metric_data_vec.get_mut(m).unwrap().metrics = Option::from(delta_count_from_header);
+            // Length includes the reference sample. Callers that kept
+            // only `delta_count` elements dropped the last sample of
+            // every chunk, and dropped the only sample of a chunk whose
+            // sample_count was 0.
+            metric.metrics = Some(samples.len());
+            metric.data = Some(samples);
+            count += 1;
         }
 
         Ok(count)
@@ -386,9 +549,10 @@ impl FTDCFileDecoder {
     /// A clean `FTDCFileDecoder` structure.
     pub fn new() -> FTDCFileDecoder {
         FTDCFileDecoder {
-            metadata: "".to_string(),
-            parameters: "".to_string(),
-            metric_chunks_count: 0,
+            metadata_docs: Vec::new(),
+            metadata_deltas: Vec::new(),
+            document_count: 0,
+            skipped_chunk_types: Vec::new(),
             binary_chunks: vec![],
         }
     }
@@ -413,60 +577,40 @@ impl FTDCFileDecoder {
                     match Document::from_reader(&mut reader) {
                         // If it can be read...
                         Ok(metrics) => {
-                            if let Some(chunk_type) = metrics.get("type") {
-                                // println!("Chunk type: {}", chunk_type);
-                                match chunk_type.as_i32().unwrap() {
-                                    FTDCFileDecoder::METADATA => {
-                                        // Doc key is a JSON structure with the host's information.
-                                        match metrics.get("doc") {
-                                            Some(doc) => {
-                                                self.metadata = doc.to_string();
-                                            }
-                                            _ => {
-                                                //println!("'doc' type not found");
-                                                return Err(FileDecoderError::Other(anyhow!(
-                                                    "'doc' key not found in METADATA chunk. "
-                                                )));
-                                            }
-                                        }
-                                    }
-                                    FTDCFileDecoder::METRICS => {
-                                        if metrics.contains_key("data") {
-                                            if let Bson::Binary(b) = metrics.get("data").unwrap() {
-                                                self.binary_chunks.push(b.clone());
-                                            }
-                                        } else {
-                                            //println!("'data' type not found");
-                                            return Err(FileDecoderError::Other(anyhow!(
-                                                "'data' key not found in METRICS chunk. "
-                                            )));
-                                        }
-                                    }
-                                    FTDCFileDecoder::PARAMETERS => {
-                                        // Doc key is a JSON structure with the host's information.
-                                        match metrics.get("doc") {
-                                            Some(doc) => {
-                                                self.parameters = doc.to_string();
-                                            }
-                                            _ => {
-                                                //println!("doc type not found");
-                                                return Err(FileDecoderError::Other(anyhow!(
-                                                    "'doc' key not found in PARAMETERS chunk. "
-                                                )));
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        return Err(FileDecoderError::Other(anyhow!(
-                                            "Unknown BSON doc type {chunk_type:?}"
-                                        )));
-                                    }
+                            // Count this document even when we skip it, so
+                            // `document_count` describes the file rather than
+                            // only the documents we knew how to use.
+                            self.document_count += 1;
+                            match chunk_type_of(&metrics)? {
+                                TYPE_METADATA => {
+                                    self.metadata_docs
+                                        .push(embedded_doc(&metrics, "doc", "metadata")?);
                                 }
-                            } else {
-                                println!("'type' not found");
-                                return Err(FileDecoderError::Other(anyhow!(
-                                    "'type' key not found in chunk. "
-                                )));
+                                TYPE_METRIC_CHUNK => {
+                                    self.binary_chunks.push(metric_blob(&metrics)?);
+                                }
+                                TYPE_METADATA_DELTA => {
+                                    // Keep every delta. A file from MongoDB 7+
+                                    // has one of these before the first metric
+                                    // chunk, and a long-running process appends
+                                    // more as parameters change. Replacing the
+                                    // previous value would leave only the last.
+                                    self.metadata_deltas.push(embedded_doc(
+                                        &metrics,
+                                        "doc",
+                                        "metadata delta",
+                                    )?);
+                                }
+                                other => {
+                                    // Do not abort. The metric chunks after an
+                                    // unknown type are still valid samples, and
+                                    // failing here is how a whole archive used
+                                    // to be discarded because of one document.
+                                    log::warn!(
+                                        "skipping unrecognised FTDC chunk type {other}; metric chunks around it are still read"
+                                    );
+                                    self.skipped_chunk_types.push(other);
+                                }
                             }
                         }
                         Err(e) => {
@@ -476,7 +620,6 @@ impl FTDCFileDecoder {
                             break;
                         }
                     }
-                    self.metric_chunks_count += 1;
                 }
             }
             Err(e) => {
@@ -547,27 +690,25 @@ impl FTDCFileDecoder {
                     )?;
 
                     for metric in metric_data {
-                        if let Some(old_slice) = metric.data
-                            && let Some(used_metrics) = metric.metrics
-                        {
-                            // remove first char, which is a dot.
+                        if let Some(mut samples) = metric.data {
+                            // `samples` already has the reference value and
+                            // every reconstructed delta. Append the whole
+                            // vector. Slicing it down to the header's
+                            // sample_count drops the last point.
                             let name = String::from(metric.name).split_off(1);
 
                             let mut out = mdh.lock().unwrap();
                             if out.contains_key(&name) {
                                 if let Some(metric_member_data) = out.get_mut(&name) {
-                                    // add slice to vector
-                                    metric_member_data
-                                        .append(&mut old_slice[0..used_metrics].to_vec());
+                                    metric_member_data.append(&mut samples);
                                 } else {
                                     return Err(FileDecoderError::Other(anyhow!(
                                         "Could not find metric name '{name}'"
                                     )));
                                 }
                             } else {
-                                // insert new
                                 let mut vec = Vec::with_capacity(Self::INITIAL_METRIC_CAPACITY);
-                                vec.append(&mut old_slice[0..used_metrics].to_vec());
+                                vec.append(&mut samples);
                                 out.insert(name, vec);
                             }
                         } else {
@@ -703,10 +844,24 @@ impl FTDCFileDecoder {
                 .collect();
 
             // Convert the Metadata struct to a JSON string
+            // The sidecar still stores one string per group. The reader
+            // keeps every document; the export that writes them as a JSON
+            // array lands with the CLI changes. `Document`'s `Display` is
+            // what the previous field stored, so the same text is kept here.
+            let metadata = parsed_file
+                .metadata_docs
+                .last()
+                .map(|doc| doc.to_string())
+                .unwrap_or_default();
+            let parameters = parsed_file
+                .metadata_deltas
+                .last()
+                .map(|doc| doc.to_string())
+                .unwrap_or_default();
             let json_data = serde_json::json!({
-                "metadata": parsed_file.metadata,
-                "parameters":parsed_file.parameters,
-                "chunks_in_file": parsed_file.metric_chunks_count,
+                "metadata": metadata,
+                "parameters": parameters,
+                "chunks_in_file": parsed_file.document_count,
                 "metrics": metric_names,
 
             });
@@ -722,6 +877,60 @@ impl FTDCFileDecoder {
         }
 
         Ok(())
+    }
+}
+
+/// Read the chunk `type` without panicking when it is missing or not an int.
+///
+/// The server writes it with `appendNumber`, which is an int32 for these
+/// small values. int64 is accepted too, because a permissive writer (and
+/// some round-trips through extended JSON) will widen it.
+fn chunk_type_of(doc: &Document) -> Result<i32, FileDecoderError> {
+    match doc.get("type") {
+        Some(Bson::Int32(value)) => Ok(*value),
+        Some(Bson::Int64(value)) => i32::try_from(*value).map_err(|_| {
+            FileDecoderError::Other(anyhow!("FTDC chunk type {value} does not fit in an int32"))
+        }),
+        Some(other) => Err(FileDecoderError::Other(anyhow!(
+            "FTDC chunk type is {other:?}, expected an int"
+        ))),
+        None => Err(FileDecoderError::Other(anyhow!(
+            "'type' key not found in chunk"
+        ))),
+    }
+}
+
+/// Take the embedded document stored under `key`.
+///
+/// Type 0 and type 2 both keep their payload in `doc`. A chunk that claims
+/// to be one of those and has no document is corrupt; unlike an unknown
+/// type number, there is nothing sensible to skip to.
+fn embedded_doc(doc: &Document, key: &str, kind: &str) -> Result<Document, FileDecoderError> {
+    match doc.get(key) {
+        Some(Bson::Document(inner)) => Ok(inner.clone()),
+        Some(other) => Err(FileDecoderError::Other(anyhow!(
+            "'{key}' in an FTDC {kind} chunk is {other:?}, expected a document"
+        ))),
+        None => Err(FileDecoderError::Other(anyhow!(
+            "'{key}' key not found in an FTDC {kind} chunk"
+        ))),
+    }
+}
+
+/// Take the compressed blob from a type 1 chunk.
+///
+/// A metric chunk whose `data` is not BinData used to be ignored, which
+/// deleted a block of samples and shifted every later timestamp. That is a
+/// broken file, so it is reported.
+fn metric_blob(doc: &Document) -> Result<Binary, FileDecoderError> {
+    match doc.get("data") {
+        Some(Bson::Binary(blob)) => Ok(blob.clone()),
+        Some(other) => Err(FileDecoderError::Other(anyhow!(
+            "'data' in an FTDC metric chunk is {other:?}, expected BinData"
+        ))),
+        None => Err(FileDecoderError::Other(anyhow!(
+            "'data' key not found in an FTDC metric chunk"
+        ))),
     }
 }
 
@@ -755,13 +964,72 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_should_read_5_chunks() {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
-        assert_eq!(parsed_file.metric_chunks_count, 213);
+        assert_eq!(parsed_file.document_count, 213);
+    }
+
+    /// A MongoDB 7+ archive starts with metadata, then a type 2 delta,
+    /// and only then the metric chunks. An unknown type must not end
+    /// the read, and a second delta must not replace the first.
+    #[test]
+    fn type2_and_unknown_types_do_not_abort_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("ftdc-rs-chunk-types-{}.bin", std::process::id()));
+        let mut bytes = Vec::new();
+        let documents = [
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(0),
+                "type": 0i32,
+                "doc": { "host": "a.example" }
+            },
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(1),
+                "type": 2i32,
+                "count": 0i32,
+                "doc": { "param": 1i32 }
+            },
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(2),
+                "type": 9i32,
+                "doc": { "future": true }
+            },
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(3),
+                "type": 2i32,
+                "count": 1i32,
+                "doc": { "param": 2i32 }
+            },
+        ];
+        for document in &documents {
+            document.to_writer(&mut bytes).unwrap();
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut parsed_file = FTDCFileDecoder::new();
+        parsed_file
+            .read_file(path.to_str().unwrap())
+            .expect("type 2 and an unknown type are not fatal");
+
+        assert_eq!(parsed_file.metadata_docs.len(), 1);
+        assert_eq!(
+            parsed_file.metadata_docs[0].get_str("host").unwrap(),
+            "a.example"
+        );
+        assert_eq!(parsed_file.metadata_deltas.len(), 2);
+        assert_eq!(parsed_file.metadata_deltas[0].get_i32("param").unwrap(), 1);
+        assert_eq!(parsed_file.metadata_deltas[1].get_i32("param").unwrap(), 2);
+        assert_eq!(parsed_file.skipped_chunk_types, vec![9]);
+        assert_eq!(parsed_file.document_count, 4);
+        assert!(parsed_file.binary_chunks.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_inflate_chunks() {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
@@ -782,6 +1050,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn get_metric_meta_data() -> () {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
@@ -807,6 +1076,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_metric_deltas() -> () {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
@@ -844,6 +1114,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_get_metric_data_decoded() -> () {
         let mut parsed_file = FTDCFileDecoder::new();
         let data_vec = parsed_file.read_and_decode(TEST_FILE_PATH, None).unwrap();
@@ -853,6 +1124,227 @@ mod tests {
         });
 
         assert!(true);
+    }
+
+    /// Encode `n` as the unsigned LEB128 that [`unpack`] reads back.
+    fn encode_varint(mut n: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Encode a column-major delta list the way the compressor does.
+    ///
+    /// A run of *k* zeros becomes the two varints `[0, k - 1]`. The
+    /// first 0 is a zero delta. The second number is how many more
+    /// zeros follow it, not how many zeros there were in total.
+    fn encode_deltas(deltas: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < deltas.len() {
+            if deltas[index] != 0 {
+                out.extend(encode_varint(deltas[index]));
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < deltas.len() && deltas[index] == 0 {
+                index += 1;
+            }
+            let run = (index - start) as u64;
+            out.extend(encode_varint(0));
+            out.extend(encode_varint(run - 1));
+        }
+        out
+    }
+
+    /// Build a one-chunk FTDC file and return its path.
+    ///
+    /// `sample_count` is the header value: the number of deltas per
+    /// metric, not the number of samples. `deltas` is column-major,
+    /// metric 0's deltas first.
+    fn write_one_chunk(
+        reference: &bson::Document,
+        metric_count: u32,
+        sample_count: u32,
+        deltas: &[u64],
+    ) -> std::path::PathBuf {
+        use std::io::Write;
+
+        let mut payload = Vec::new();
+        reference.to_writer(&mut payload).unwrap();
+        payload.extend_from_slice(&metric_count.to_le_bytes());
+        payload.extend_from_slice(&sample_count.to_le_bytes());
+        payload.extend(encode_deltas(deltas));
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut blob = Vec::with_capacity(4 + compressed.len());
+        blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        blob.extend(compressed);
+
+        let wrapper = bson::doc! {
+            "_id": bson::DateTime::from_millis(0),
+            "type": 1i32,
+            "data": bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: blob,
+            }
+        };
+        let mut file = Vec::new();
+        wrapper.to_writer(&mut file).unwrap();
+
+        // Unique per call. Several tests build a chunk with the same
+        // sample_count, and `cargo test` runs them on more than one thread.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CHUNK_SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ftdc-rs-chunk-{}-{}.bin",
+            std::process::id(),
+            CHUNK_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, file).unwrap();
+        path
+    }
+
+    /// The walkthrough in the server FTDC README, plus the two edges the
+    /// fixed `[u64; 300]` buffer got wrong.
+    ///
+    /// Four documents `{a, x, s}` become a reference of `{a:1, x:2}`
+    /// (the string is not a metric) and the delta block `[1, 1, 1, 0, 2]`.
+    /// The reconstructed series have four points, not three. A chunk
+    /// with `sample_count == 0` still yields the reference. A chunk with
+    /// 300 deltas used to write `metric_values[300]` and panic.
+    #[test]
+    fn reference_sample_is_kept_and_a_full_chunk_does_not_panic() {
+        let reference = bson::doc! { "a": 1i32, "x": 2i32, "s": "t" };
+        // a grows 1,2,3,4. x stays 2. Three zeros encode as [0, 2].
+        let path = write_one_chunk(&reference, 2, 3, &[1, 1, 1, 0, 0, 0]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            series.get("a").map(Vec::as_slice),
+            Some([1, 2, 3, 4].as_slice())
+        );
+        assert_eq!(
+            series.get("x").map(Vec::as_slice),
+            Some([2, 2, 2, 2].as_slice())
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let reference_only = write_one_chunk(&reference, 2, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(reference_only.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(series.get("a").map(Vec::as_slice), Some([1].as_slice()));
+        assert_eq!(series.get("x").map(Vec::as_slice), Some([2].as_slice()));
+        let _ = std::fs::remove_file(&reference_only);
+
+        let wide = bson::doc! { "n": 0i64 };
+        let path = write_one_chunk(&wide, 1, 300, &vec![1u64; 300]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        let values = series.get("n").expect("metric n");
+        assert_eq!(values.len(), 301);
+        assert_eq!(values[0], 0);
+        assert_eq!(values[300], 300);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ObjectId and string are not metrics. Decimal128 is one int64,
+    /// truncated toward zero. An array element is `key.<index>`.
+    /// A header count that does not match the walk is an error.
+    #[test]
+    fn extraction_matches_the_compressor_metric_list() {
+        let oid = bson::oid::ObjectId::from_bytes([0x11; 12]);
+        let reference = bson::doc! {
+            "label": "host",
+            "id": oid,
+            "n": 7i32,
+            "ok": true,
+        };
+        let path = write_one_chunk(&reference, 2, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(series.len(), 2, "objectid and string must not be columns");
+        assert_eq!(series.get("n").map(Vec::as_slice), Some([7].as_slice()));
+        assert_eq!(series.get("ok").map(Vec::as_slice), Some([1].as_slice()));
+        assert!(!series.contains_key("id"));
+        assert!(!series.contains_key("label"));
+        let _ = std::fs::remove_file(&path);
+
+        // Counting the ObjectId would make the walk 3 long. The header
+        // says 3 on purpose, which is what a decoder that emits ObjectIds
+        // would believe. The lengths disagree, so the delta block must
+        // not be applied. The check is on the chunk itself; the threaded
+        // merge still drops worker errors, and that is fixed separately.
+        let path = write_one_chunk(&reference, 3, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        parsed.read_file(path.to_str().unwrap()).unwrap();
+        let inflated = parsed.uncompress_data().unwrap();
+        let mut metrics = FTDCFileDecoder::extract_metric_meta_data(&inflated[0]).unwrap();
+        let err = FTDCFileDecoder::extract_all_metrics_from_buffer(&mut metrics, &inflated[0])
+            .expect_err("a walk that does not match metric_count must fail");
+        let message = err.to_string();
+        assert!(message.contains("3"), "{message}");
+        let _ = std::fs::remove_file(&path);
+
+        let decimal: bson::Decimal128 = "42.9".parse().unwrap();
+        let reference = bson::doc! { "amount": decimal };
+        let path = write_one_chunk(&reference, 1, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            series.get("amount").map(Vec::as_slice),
+            Some([42].as_slice())
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let reference = bson::doc! {
+            "members": [ { "health": 1i32 }, { "health": 2i32 } ]
+        };
+        let path = write_one_chunk(&reference, 2, 0, &[]);
+        let mut parsed = FTDCFileDecoder::new();
+        let series = parsed
+            .read_and_decode(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            series.get("members.0.health").map(Vec::as_slice),
+            Some([1].as_slice())
+        );
+        assert_eq!(
+            series.get("members.1.health").map(Vec::as_slice),
+            Some([2].as_slice())
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(super::decimal_text_to_i64("1.05E+3"), 1050);
+        assert_eq!(super::decimal_text_to_i64("-3.2"), -3);
+        assert_eq!(super::decimal_text_to_i64("NaN"), 0);
+        assert_eq!(super::decimal_text_to_i64("Infinity"), i64::MAX);
+        assert_eq!(super::decimal_text_to_i64("-Infinity"), i64::MIN);
     }
 
     #[test]
