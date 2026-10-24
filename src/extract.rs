@@ -35,14 +35,63 @@
 //! a document or an array element. Array elements use the decimal index as
 //! the key (`members.0.health`). A timestamp's two metrics are `field_time`
 //! and `field_increment`, seconds then increment.
+//!
+//! Each metric also keeps the rule that produced it ([`MetricKind`]). The
+//! stored sample is still the `u64` bit pattern. The kind is how a caller
+//! tells a counter, a truncated double, a boolean, and a timestamp apart.
 
 use crate::errors::FileDecoderError;
 use bson::{Bson, Document};
+
+/// Which compressor rule produced a metric's `u64` bits.
+///
+/// int32 and int64 share [`MetricKind::Int`]: both are `numberLong`'s bit
+/// pattern. Decimal128 is separate. It also ends as `numberLong`, but the
+/// conversion is the decimal truncation, not the double arm and not an
+/// integer load. A timestamp is two columns, seconds then increment, and
+/// the two kinds stay in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    Double,
+    Int,
+    Decimal,
+    Bool,
+    Date,
+    TimestampSeconds,
+    TimestampIncrement,
+}
+
+impl MetricKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Double => "double",
+            Self::Int => "int",
+            Self::Decimal => "decimal",
+            Self::Bool => "bool",
+            Self::Date => "date",
+            Self::TimestampSeconds => "timestampSeconds",
+            Self::TimestampIncrement => "timestampIncrement",
+        }
+    }
+}
+
+/// One decoded metric: the compressor's kind, and one sample per row.
+///
+/// `values` are the `u64` bit patterns. A missing sample is `None`. `kind`
+/// is taken from the chunk that introduced the name. A later chunk that
+/// classifies the same name with a different kind is an error: the sidecar
+/// would otherwise describe the column as something the later samples are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricColumn {
+    pub kind: MetricKind,
+    pub values: Vec<Option<u64>>,
+}
 
 #[derive(Debug)]
 pub(crate) struct MetricData {
     pub(crate) name: String,
     pub(crate) initial: u64,
+    pub(crate) kind: MetricKind,
     /// BSON value this sample was taken from. Kept so a metric_count
     /// mismatch can say which field disagreed with the compressor.
     #[allow(dead_code)]
@@ -57,10 +106,17 @@ pub(crate) struct MetricData {
     pub(crate) data: Option<Vec<u64>>,
 }
 
-pub(crate) fn push_metric(name: &str, initial: u64, metric_type: Bson, out: &mut Vec<MetricData>) {
+pub(crate) fn push_metric(
+    name: &str,
+    initial: u64,
+    kind: MetricKind,
+    metric_type: Bson,
+    out: &mut Vec<MetricData>,
+) {
     out.push(MetricData {
         name: name.to_string(),
         initial,
+        kind,
         metric_type,
         metrics: None,
         data: None,
@@ -201,20 +257,40 @@ pub(crate) fn extract_metric_data_from_doc(
         let path = metric_path(doc_name, &key);
         match value {
             Bson::Double(v) => {
-                push_metric(&path, double_to_metric(v), value, metric_data);
+                push_metric(
+                    &path,
+                    double_to_metric(v),
+                    MetricKind::Double,
+                    value,
+                    metric_data,
+                );
             }
-            Bson::Int32(v) => push_metric(&path, v as u64, value, metric_data),
-            Bson::Int64(v) => push_metric(&path, v as u64, value, metric_data),
+            Bson::Int32(v) => push_metric(&path, v as u64, MetricKind::Int, value, metric_data),
+            Bson::Int64(v) => push_metric(&path, v as u64, MetricKind::Int, value, metric_data),
             Bson::Decimal128(v) => {
                 // `BSONElement::numberLong()` for NumberDecimal, which is
                 // what the compressor calls. One uint64, not a sentinel.
                 // The sentinel 999999999 used to be the base every delta
                 // in this column was added to.
-                push_metric(&path, decimal128_to_metric(&v), value, metric_data);
+                push_metric(
+                    &path,
+                    decimal128_to_metric(&v),
+                    MetricKind::Decimal,
+                    value,
+                    metric_data,
+                );
             }
-            Bson::Boolean(v) => push_metric(&path, u64::from(v), value, metric_data),
+            Bson::Boolean(v) => {
+                push_metric(&path, u64::from(v), MetricKind::Bool, value, metric_data)
+            }
             Bson::DateTime(v) => {
-                push_metric(&path, v.timestamp_millis() as u64, value, metric_data);
+                push_metric(
+                    &path,
+                    v.timestamp_millis() as u64,
+                    MetricKind::Date,
+                    value,
+                    metric_data,
+                );
             }
             Bson::Timestamp(v) => {
                 // Two metrics, seconds then increment. The names gain a
@@ -223,12 +299,14 @@ pub(crate) fn extract_metric_data_from_doc(
                 push_metric(
                     &format!("{path}_time"),
                     u64::from(v.time),
+                    MetricKind::TimestampSeconds,
                     value.clone(),
                     metric_data,
                 );
                 push_metric(
                     &format!("{path}_increment"),
                     u64::from(v.increment),
+                    MetricKind::TimestampIncrement,
                     value,
                     metric_data,
                 );
