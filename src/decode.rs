@@ -79,13 +79,13 @@ pub(crate) const MAX_UNCOMPRESSED_CHUNK: usize = 10_000_000;
 /// front of the zlib stream. A blob shorter than that is not a metric chunk.
 pub(crate) fn inflate_owned(bytes: &[u8]) -> Result<Vec<u8>, FileDecoderError> {
     if bytes.len() < 4 {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::truncated(format!(
             "metric blob is shorter than the 4-byte uncompressed size"
         )));
     }
     let declared = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     if declared > MAX_UNCOMPRESSED_CHUNK {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::size_limit(format!(
             "uncompressed size {declared} exceeds the FTDC limit of {MAX_UNCOMPRESSED_CHUNK}"
         )));
     }
@@ -94,13 +94,13 @@ pub(crate) fn inflate_owned(bytes: &[u8]) -> Result<Vec<u8>, FileDecoderError> {
     let inflated = match decoder.decode_zlib() {
         Ok(encoded_data) => encoded_data,
         Err(error) => {
-            return Err(FileDecoderError::format(format!(
+            return Err(FileDecoderError::inflate(format!(
                 "zlib inflate of an FTDC metric chunk failed: {error}"
             )));
         }
     };
     if inflated.len() != declared {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::inflate(format!(
             "uncompressed size {declared} does not match the inflated length {}",
             inflated.len()
         )));
@@ -115,13 +115,13 @@ pub(crate) fn inflate_owned(bytes: &[u8]) -> Result<Vec<u8>, FileDecoderError> {
 /// those eight bytes is truncated.
 pub(crate) fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDecoderError> {
     if data.len() < 4 {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::truncated(format!(
             "inflated metric chunk is shorter than a BSON length"
         )));
     }
     let data_size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     if data_size < 5 || data.len() < data_size.saturating_add(8) {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::truncated(format!(
             "inflated metric chunk does not contain metric_count and sample_count"
         )));
     }
@@ -130,7 +130,7 @@ pub(crate) fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDeco
     let sample_count =
         u32::from_le_bytes(data[data_size + 4..data_size + 8].try_into().unwrap()) as usize;
     if metric_count.saturating_mul(sample_count) > MAX_METRIC_SAMPLES {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::size_limit(format!(
             "metric_count {metric_count} and sample_count {sample_count} exceed the FTDC limit"
         )));
     }
@@ -146,7 +146,7 @@ pub(crate) fn read_header(data: &[u8]) -> Result<(usize, usize, usize), FileDeco
 pub(crate) fn extract_all_metrics_from_buffer(
     metric_data_vec: &mut Vec<MetricData>,
     buffer: &Vec<u8>,
-    keep: &dyn Fn(&str) -> bool,
+    keep: &mut dyn FnMut(&str) -> bool,
 ) -> Result<usize, FileDecoderError> {
     let (doc_size, metric_count, delta_count) = read_header(buffer.as_slice())?;
 
@@ -163,17 +163,17 @@ pub(crate) fn extract_all_metrics_from_buffer(
             .last()
             .map(|metric| metric.name.as_str())
             .unwrap_or("(none)");
-        return Err(FileDecoderError::format(format!(
-            "extracted {} metrics from the reference document, but the chunk header says {metric_count}. \
-             Deltas are positional, so these lengths have to match or every later series is built from the wrong column. \
-             First extracted name is '{first}', last is '{last}'.",
-            metric_data_vec.len()
-        )));
+        return Err(FileDecoderError::MetricCount {
+            extracted: metric_data_vec.len(),
+            header: metric_count,
+            first: first.to_string(),
+            last: last.to_string(),
+        });
     }
 
     let offset = doc_size + 8;
     if offset > buffer.len() {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::truncated(format!(
             "metric chunk header points past the end of the inflated buffer"
         )));
     }
@@ -230,12 +230,12 @@ pub(crate) fn extract_all_metrics_from_buffer(
     // that still has zeros left, or a byte that was not read, is a delta
     // block that does not match that rectangle.
     if zeros_remaining != 0 {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::varint(format!(
             "delta block has {zeros_remaining} zeros past the last sample"
         )));
     }
     if data_range_cursor.remaining() != 0 {
-        return Err(FileDecoderError::format(format!(
+        return Err(FileDecoderError::varint(format!(
             "delta block has {} trailing bytes",
             data_range_cursor.remaining()
         )));
@@ -247,31 +247,26 @@ pub(crate) fn extract_all_metrics_from_buffer(
 /// Reconstruct one inflated chunk as `(name, kind, samples)` triples, in
 /// walk order.
 ///
-/// The name is the path `extract` built. Nothing is stripped. `kind` is
-/// the compressor rule that produced the `u64` bits: int32 and int64 are
-/// both `int`, a timestamp is two columns, and decimal128 is not a double.
-/// This function does not append to a shared map: the caller appends, in
-/// chunk order, and the order of these triples is the order those names
-/// are first recorded.
+/// The name is the path `extract` built. `kind` is the compressor rule
+/// that produced the `u64` bits. `keep` runs once per name, while that
+/// metric's deltas are consumed. A rejected metric is absent from the
+/// vector. This function does not append to a shared map: the caller
+/// appends, in chunk order, and the order of these triples is the order
+/// those names are first recorded.
 pub(crate) fn decode_one_chunk(
     chunk: Vec<u8>,
-    keep: &dyn Fn(&str) -> bool,
+    keep: &mut dyn FnMut(&str) -> bool,
 ) -> Result<(usize, Vec<(String, MetricKind, Vec<u64>)>), FileDecoderError> {
     let mut metric_data = crate::extract::extract_metric_meta_data(&chunk)?;
     let height = extract_all_metrics_from_buffer(&mut metric_data, &chunk, keep)?;
 
     let mut columns = Vec::with_capacity(metric_data.len());
     for metric in metric_data {
-        let kept = keep(&metric.name);
-        match metric.data {
-            Some(samples) if kept => columns.push((metric.name, metric.kind, samples)),
-            None if !kept => {}
-            _ => {
-                return Err(FileDecoderError::format(format!(
-                    "metric '{}' produced no samples",
-                    metric.name
-                )));
-            }
+        // `data` is set only when `keep` accepted the name. The deltas
+        // were consumed either way, so a second call would see a FnMut
+        // predicate twice.
+        if let Some(samples) = metric.data {
+            columns.push((metric.name, metric.kind, samples));
         }
     }
     Ok((height, columns))
@@ -308,7 +303,7 @@ pub(crate) fn append_chunk(
 
     for (name, kind, samples) in columns {
         if samples.len() != height {
-            return Err(FileDecoderError::format(format!(
+            return Err(FileDecoderError::ragged(format!(
                 "metric '{name}' has {} samples in a chunk whose other metrics have {height}",
                 samples.len()
             )));

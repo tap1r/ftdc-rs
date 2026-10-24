@@ -146,6 +146,7 @@ fn main() -> ExitCode {
             && let Err(error) = display_file_info(file_name)
         {
             log::error!("{error}");
+            failed = true;
         }
 
         let Some(out_file) = parquet_output(&args.output_path, file_name) else {
@@ -161,7 +162,12 @@ fn main() -> ExitCode {
             out_file.display()
         );
 
-        match Archive::write_to_parquet(file_name, &out_file, metadata.as_deref(), filter.clone()) {
+        match Archive::write_to_parquet(file_name, &out_file, metadata.as_deref(), |name| {
+            filter
+                .as_ref()
+                .map(|expression| expression.is_match(name))
+                .unwrap_or(true)
+        }) {
             Ok(()) => println!("Successfully written to {}", out_file.display()),
             Err(error) => {
                 log::error!("failed to write {}: {error}", out_file.display());

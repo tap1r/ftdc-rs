@@ -14,7 +14,8 @@
 //!   the server compressor keeps.
 //! * `varint` reads one unsigned LEB128 integer from the delta block.
 //! * `export` writes the aligned series to Parquet. A sample that did not
-//!   exist is null.
+//!   exist is null. That module is behind the `parquet` feature, which is
+//!   on by default. Decoding and the metadata sidecar do not need it.
 //!
 //! Chunks are inflated and appended one at a time, in file order, which
 //! is the order of the samples.
@@ -22,11 +23,13 @@
 mod archive;
 mod decode;
 mod errors;
+#[cfg(feature = "parquet")]
 mod export;
 mod extract;
 mod varint;
 
 pub use archive::{Archive, MetadataDelta, MetadataDocument, MetricChunk};
+pub use errors::FileDecoderError;
 pub use extract::{MetricColumn, MetricKind};
 
 #[cfg(test)]
@@ -47,7 +50,7 @@ mod tests {
     }
 
     fn open_decoded(path: impl AsRef<std::path::Path>) -> IndexMap<String, MetricColumn> {
-        Archive::open(path).unwrap().decode(None).unwrap()
+        Archive::open(path).unwrap().decode(|_| true).unwrap()
     }
 
     /// A MongoDB 7+ archive starts with metadata, then a type 2 delta,
@@ -306,8 +309,9 @@ mod tests {
         let parsed = Archive::open(&path).unwrap();
         let inflated = crate::decode::inflate_owned(&parsed.chunks[0].bytes).unwrap();
         let mut metrics = crate::extract::extract_metric_meta_data(&inflated).unwrap();
+        let mut keep_all = |_: &str| true;
         let err =
-            crate::decode::extract_all_metrics_from_buffer(&mut metrics, &inflated, &|_| true)
+            crate::decode::extract_all_metrics_from_buffer(&mut metrics, &inflated, &mut keep_all)
                 .expect_err("a walk that does not match metric_count must fail");
         let message = err.to_string();
         assert!(message.contains("3"), "{message}");
@@ -377,7 +381,7 @@ mod tests {
         let path = write_one_chunk(&reference, 2, 0, &[]);
         let err = Archive::open(&path)
             .unwrap()
-            .decode(None)
+            .decode(|_| true)
             .expect_err("metric_count mismatch must fail decode");
         assert!(err.to_string().contains("2"), "{err}");
         let _ = std::fs::remove_file(&path);
@@ -406,10 +410,13 @@ mod tests {
             Some([None, Some(3), Some(4)].as_slice())
         );
 
-        let df = Archive::metrics_to_dataframe(series).unwrap();
-        assert_eq!(df.height(), 3);
-        assert_eq!(df.column("b").unwrap().u64().unwrap().get(0), None);
-        assert_eq!(df.column("a").unwrap().u64().unwrap().get(2), None);
+        #[cfg(feature = "parquet")]
+        {
+            let df = Archive::metrics_to_dataframe(series).unwrap();
+            assert_eq!(df.height(), 3);
+            assert_eq!(df.column("b").unwrap().u64().unwrap().get(0), None);
+            assert_eq!(df.column("a").unwrap().u64().unwrap().get(2), None);
+        }
 
         let _ = std::fs::remove_file(&only_a);
         let _ = std::fs::remove_file(&a_and_b);
@@ -418,6 +425,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parquet")]
     fn test_to_dataframe() {
         let mut test_metrics: IndexMap<String, MetricColumn> = IndexMap::new();
         test_metrics.insert(
@@ -606,23 +614,26 @@ mod tests {
         assert_eq!(series["ts_increment"].kind, MetricKind::TimestampIncrement);
         assert_eq!(series["wide"].kind, MetricKind::Double);
 
-        let df = Archive::metrics_to_dataframe(series).unwrap();
-        let columns: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        assert_eq!(
-            columns,
-            vec![
-                "z".to_string(),
-                "neg".to_string(),
-                "nested.m".to_string(),
-                "ts_time".to_string(),
-                "ts_increment".to_string(),
-                "wide".to_string()
-            ]
-        );
+        #[cfg(feature = "parquet")]
+        {
+            let df = Archive::metrics_to_dataframe(series).unwrap();
+            let columns: Vec<String> = df
+                .get_column_names()
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            assert_eq!(
+                columns,
+                vec![
+                    "z".to_string(),
+                    "neg".to_string(),
+                    "nested.m".to_string(),
+                    "ts_time".to_string(),
+                    "ts_increment".to_string(),
+                    "wide".to_string()
+                ]
+            );
+        }
         let _ = std::fs::remove_file(&path);
 
         // `m` sorts before `z`, and it is new in the second chunk, so it
@@ -698,7 +709,16 @@ mod tests {
         let sidecar = dir.join(format!("ftdc-rs-meta-{}.metadata.json", std::process::id()));
         std::fs::write(&input, bytes).unwrap();
 
-        Archive::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
+        // The sidecar does not need Polars. The Parquet file does, so a
+        // build without the `parquet` feature still checks the JSON.
+        #[cfg(feature = "parquet")]
+        Archive::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), |_| true).unwrap();
+        #[cfg(not(feature = "parquet"))]
+        {
+            let archive = Archive::open(&input).unwrap();
+            let metrics = archive.decode(|_| true).unwrap();
+            archive.write_sidecar(&metrics, &sidecar).unwrap();
+        }
 
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
@@ -722,12 +742,15 @@ mod tests {
         assert_eq!(json["metrics"], serde_json::json!(["n"]));
         assert_eq!(json["metricTypes"]["n"], "int");
 
-        use polars::prelude::SerReader;
-        let mut file = std::fs::File::open(&parquet).unwrap();
-        let frame = polars::prelude::ParquetReader::new(&mut file)
-            .finish()
-            .unwrap();
-        assert_eq!(frame.column("n").unwrap().u64().unwrap().get(0), Some(4));
+        #[cfg(feature = "parquet")]
+        {
+            use polars::prelude::SerReader;
+            let mut file = std::fs::File::open(&parquet).unwrap();
+            let frame = polars::prelude::ParquetReader::new(&mut file)
+                .finish()
+                .unwrap();
+            assert_eq!(frame.column("n").unwrap().u64().unwrap().get(0), Some(4));
+        }
 
         let _ = std::fs::remove_file(&chunk);
         let _ = std::fs::remove_file(&input);
@@ -787,39 +810,49 @@ mod tests {
         ));
         std::fs::write(&input, bytes).unwrap();
 
-        Archive::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), None).unwrap();
+        #[cfg(feature = "parquet")]
+        Archive::write_to_parquet(&input, &parquet, Some(sidecar.as_path()), |_| true).unwrap();
+        #[cfg(not(feature = "parquet"))]
+        {
+            let archive = Archive::open(&input).unwrap();
+            let metrics = archive.decode(|_| true).unwrap();
+            archive.write_sidecar(&metrics, &sidecar).unwrap();
+        }
 
-        use polars::prelude::SerReader;
-        let mut file = std::fs::File::open(&parquet).unwrap();
-        let frame = polars::prelude::ParquetReader::new(&mut file)
-            .finish()
-            .unwrap();
-        let columns: Vec<String> = frame
-            .get_column_names()
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        assert_eq!(columns, vec!["a".to_string(), "x".to_string()]);
-        assert_eq!(
-            frame
-                .column("a")
-                .unwrap()
-                .u64()
-                .unwrap()
-                .into_no_null_iter()
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
-        );
-        assert_eq!(
-            frame
-                .column("x")
-                .unwrap()
-                .u64()
-                .unwrap()
-                .into_no_null_iter()
-                .collect::<Vec<_>>(),
-            vec![2, 2, 2, 2]
-        );
+        #[cfg(feature = "parquet")]
+        {
+            use polars::prelude::SerReader;
+            let mut file = std::fs::File::open(&parquet).unwrap();
+            let frame = polars::prelude::ParquetReader::new(&mut file)
+                .finish()
+                .unwrap();
+            let columns: Vec<String> = frame
+                .get_column_names()
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            assert_eq!(columns, vec!["a".to_string(), "x".to_string()]);
+            assert_eq!(
+                frame
+                    .column("a")
+                    .unwrap()
+                    .u64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4]
+            );
+            assert_eq!(
+                frame
+                    .column("x")
+                    .unwrap()
+                    .u64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .collect::<Vec<_>>(),
+                vec![2, 2, 2, 2]
+            );
+        }
 
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
@@ -879,17 +912,23 @@ mod tests {
     fn delta_block_must_end_on_the_last_sample() {
         let reference = bson::doc! { "n": 1i64 };
         let leftover = write_one_chunk(&reference, 1, 1, &[0, 0, 0]);
-        let err = Archive::open(&leftover).unwrap().decode(None).unwrap_err();
+        let err = Archive::open(&leftover)
+            .unwrap()
+            .decode(|_| true)
+            .unwrap_err();
         assert!(err.to_string().contains("zeros past"), "{err}");
         let _ = std::fs::remove_file(&leftover);
 
         let trailing = write_chunk(&reference, 1, 0, &[], &[0x01]);
-        let err = Archive::open(&trailing).unwrap().decode(None).unwrap_err();
+        let err = Archive::open(&trailing)
+            .unwrap()
+            .decode(|_| true)
+            .unwrap_err();
         assert!(err.to_string().contains("trailing"), "{err}");
         let _ = std::fs::remove_file(&trailing);
 
         let short = write_one_chunk(&reference, 1, 1, &[]);
-        let err = Archive::open(&short).unwrap().decode(None).unwrap_err();
+        let err = Archive::open(&short).unwrap().decode(|_| true).unwrap_err();
         assert!(err.to_string().contains("end"), "{err}");
         let _ = std::fs::remove_file(&short);
 
@@ -921,7 +960,7 @@ mod tests {
         std::fs::write(&mismatched, rewritten).unwrap();
         let err = Archive::open(&mismatched)
             .unwrap()
-            .decode(None)
+            .decode(|_| true)
             .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("does not match"), "{message}");
@@ -938,7 +977,7 @@ mod tests {
         let mut rewritten = Vec::new();
         document.to_writer(&mut rewritten).unwrap();
         std::fs::write(&huge, rewritten).unwrap();
-        let err = Archive::open(&huge).unwrap().decode(None).unwrap_err();
+        let err = Archive::open(&huge).unwrap().decode(|_| true).unwrap_err();
         assert!(err.to_string().contains("10000000"), "{err}");
         let _ = std::fs::remove_file(&huge);
 
@@ -964,7 +1003,7 @@ mod tests {
 
         let series = Archive::open(&path)
             .unwrap()
-            .decode(Some(regex::Regex::new("^c$").unwrap()))
+            .decode(|name| name == "c")
             .unwrap();
         let names: Vec<&str> = series.keys().map(String::as_str).collect();
         assert_eq!(names, ["c"]);
@@ -1001,7 +1040,7 @@ mod tests {
         bytes.extend(std::fs::read(&second).unwrap());
         let path = std::env::temp_dir().join(format!("ftdc-rs-kind-{}.bin", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
-        let err = Archive::open(&path).unwrap().decode(None).unwrap_err();
+        let err = Archive::open(&path).unwrap().decode(|_| true).unwrap_err();
         assert!(err.to_string().contains("double"), "{err}");
         assert!(err.to_string().contains("int"), "{err}");
         let _ = std::fs::remove_file(&first);

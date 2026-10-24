@@ -43,14 +43,14 @@ pub(crate) fn unpack(data_range_cursor: &mut RangeCursor) -> Result<u64, FileDec
 
     loop {
         if data_range_cursor.at >= data_range_cursor.buffer.len() {
-            return Err(FileDecoderError::format(format!(
+            return Err(FileDecoderError::varint(format!(
                 "FTDC varint ran past the end of the delta block"
             )));
         }
         // A u64 has room for 10 payload bytes (9 * 7 + 1). One more byte
         // would shift by 70 and panic, and it cannot be a legal value.
         if shift >= 64 {
-            return Err(FileDecoderError::format(format!(
+            return Err(FileDecoderError::varint(format!(
                 "FTDC varint is wider than 64 bits"
             )));
         }
