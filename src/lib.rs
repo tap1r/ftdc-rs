@@ -16,8 +16,8 @@
 //! * `export` writes the aligned series to Parquet. A sample that did not
 //!   exist is null.
 //!
-//! Chunks are inflated and decoded in parallel. They are appended in file
-//! order, which is the order of the samples.
+//! Chunks are inflated and appended one at a time, in file order, which
+//! is the order of the samples.
 
 mod archive;
 mod decode;
@@ -170,6 +170,18 @@ mod tests {
         sample_count: u32,
         deltas: &[u64],
     ) -> std::path::PathBuf {
+        write_chunk(reference, metric_count, sample_count, deltas, &[])
+    }
+
+    /// `tail` is appended to the delta block before zlib. A non-empty tail
+    /// is a chunk whose deltas do not end on the last sample.
+    fn write_chunk(
+        reference: &bson::Document,
+        metric_count: u32,
+        sample_count: u32,
+        deltas: &[u64],
+        tail: &[u8],
+    ) -> std::path::PathBuf {
         use std::io::Write;
 
         let mut payload = Vec::new();
@@ -177,6 +189,7 @@ mod tests {
         payload.extend_from_slice(&metric_count.to_le_bytes());
         payload.extend_from_slice(&sample_count.to_le_bytes());
         payload.extend(encode_deltas(deltas));
+        payload.extend(tail);
 
         let mut encoder =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -287,14 +300,14 @@ mod tests {
         // Counting the ObjectId would make the walk 3 long. The header
         // says 3 on purpose, which is what a decoder that emits ObjectIds
         // would believe. The lengths disagree, so the delta block must
-        // not be applied. The check is on the chunk itself; the threaded
-        // merge still drops worker errors, and that is fixed separately.
+        // not be applied.
         let path = write_one_chunk(&reference, 3, 0, &[]);
         let parsed = Archive::open(&path).unwrap();
-        let inflated = crate::decode::inflate_owned(parsed.chunks[0].bytes.clone()).unwrap();
+        let inflated = crate::decode::inflate_owned(&parsed.chunks[0].bytes).unwrap();
         let mut metrics = crate::extract::extract_metric_meta_data(&inflated).unwrap();
-        let err = crate::decode::extract_all_metrics_from_buffer(&mut metrics, &inflated)
-            .expect_err("a walk that does not match metric_count must fail");
+        let err =
+            crate::decode::extract_all_metrics_from_buffer(&mut metrics, &inflated, &|_| true)
+                .expect_err("a walk that does not match metric_count must fail");
         let message = err.to_string();
         assert!(message.contains("3"), "{message}");
         let _ = std::fs::remove_file(&path);
@@ -786,5 +799,140 @@ mod tests {
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&parquet);
         let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// A zero run is one pair for the whole delta block. The pair here is
+    /// `[0, 1]`, two zeros, and the second zero belongs to metric `b`.
+    /// Resetting the run at the metric boundary would feed `b` the run
+    /// length as a real delta.
+    ///
+    /// A delta of `u64::MAX` steps the counter backwards by one.
+    #[test]
+    fn zero_run_crosses_metrics_and_deltas_wrap() {
+        let reference = bson::doc! { "a": 1i64, "b": 2i64 };
+        let path = write_one_chunk(&reference, 2, 2, &[5, 0, 0, 7]);
+        let series = open_decoded(&path);
+        assert_eq!(
+            series.get("a").map(Vec::as_slice),
+            Some([Some(1), Some(6), Some(6)].as_slice())
+        );
+        assert_eq!(
+            series.get("b").map(Vec::as_slice),
+            Some([Some(2), Some(2), Some(9)].as_slice())
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let path = write_one_chunk(&bson::doc! { "n": 5i64 }, 1, 1, &[u64::MAX]);
+        let series = open_decoded(&path);
+        assert_eq!(
+            series.get("n").map(Vec::as_slice),
+            Some([Some(5), Some(4)].as_slice())
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The delta block has to end on the last sample. Extra zeros in a run,
+    /// bytes after the last varint, and a varint that runs off the buffer
+    /// are the same class of truncated or padded chunk.
+    #[test]
+    fn delta_block_must_end_on_the_last_sample() {
+        let reference = bson::doc! { "n": 1i64 };
+        let leftover = write_one_chunk(&reference, 1, 1, &[0, 0, 0]);
+        let err = Archive::open(&leftover).unwrap().decode(None).unwrap_err();
+        assert!(err.to_string().contains("zeros past"), "{err}");
+        let _ = std::fs::remove_file(&leftover);
+
+        let trailing = write_chunk(&reference, 1, 0, &[], &[0x01]);
+        let err = Archive::open(&trailing).unwrap().decode(None).unwrap_err();
+        assert!(err.to_string().contains("trailing"), "{err}");
+        let _ = std::fs::remove_file(&trailing);
+
+        let short = write_one_chunk(&reference, 1, 1, &[]);
+        let err = Archive::open(&short).unwrap().decode(None).unwrap_err();
+        assert!(err.to_string().contains("end"), "{err}");
+        let _ = std::fs::remove_file(&short);
+
+        let mut wide = crate::varint::RangeCursor::new(vec![0x80; 11]);
+        let err = crate::varint::unpack(&mut wide).unwrap_err();
+        assert!(err.to_string().contains("64"), "{err}");
+    }
+
+    /// The leading uint32 is the inflated length. It has to match the zlib
+    /// output, and it has to be within the server's 10_000_000 byte cap.
+    /// A framed length past 16 MiB is rejected before the body is read.
+    #[test]
+    fn chunk_sizes_have_to_match_the_header() {
+        let path = write_one_chunk(&bson::doc! { "n": 1i32 }, 1, 0, &[]);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut document = bson::Document::from_reader(&mut bytes.as_slice()).unwrap();
+        let bson::Bson::Binary(binary) = document.get_mut("data").unwrap() else {
+            panic!("data is BinData");
+        };
+        let declared = u32::from_le_bytes(binary.bytes[0..4].try_into().unwrap());
+        binary.bytes[0..4].copy_from_slice(&(declared - 1).to_le_bytes());
+        let mismatched = std::env::temp_dir().join(format!(
+            "ftdc-rs-size-{}-{}.bin",
+            std::process::id(),
+            declared
+        ));
+        let mut rewritten = Vec::new();
+        document.to_writer(&mut rewritten).unwrap();
+        std::fs::write(&mismatched, rewritten).unwrap();
+        let err = Archive::open(&mismatched)
+            .unwrap()
+            .decode(None)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("does not match"), "{message}");
+        assert!(message.contains(&(declared - 1).to_string()), "{message}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&mismatched);
+
+        let mut document = bson::Document::from_reader(&mut bytes.as_slice()).unwrap();
+        let bson::Bson::Binary(binary) = document.get_mut("data").unwrap() else {
+            panic!("data is BinData");
+        };
+        binary.bytes[0..4].copy_from_slice(&20_000_000u32.to_le_bytes());
+        let huge = std::env::temp_dir().join(format!("ftdc-rs-huge-{}.bin", std::process::id()));
+        let mut rewritten = Vec::new();
+        document.to_writer(&mut rewritten).unwrap();
+        std::fs::write(&huge, rewritten).unwrap();
+        let err = Archive::open(&huge).unwrap().decode(None).unwrap_err();
+        assert!(err.to_string().contains("10000000"), "{err}");
+        let _ = std::fs::remove_file(&huge);
+
+        let framed = std::env::temp_dir().join(format!("ftdc-rs-frame-{}.bin", std::process::id()));
+        let claimed = (16 * 1024 * 1024 + 1) as u32;
+        std::fs::write(&framed, claimed.to_le_bytes()).unwrap();
+        let err = Archive::open(&framed).unwrap_err();
+        assert!(err.to_string().contains("16777216"), "{err}");
+        let _ = std::fs::remove_file(&framed);
+    }
+
+    /// A filter drops columns after their deltas have been consumed. A
+    /// metric that the filter keeps, and that first appears in a later
+    /// chunk, is null for the earlier rows.
+    #[test]
+    fn filter_drops_columns_without_shifting_rows() {
+        let first = write_one_chunk(&bson::doc! { "a": 1i32, "b": 2i32 }, 2, 0, &[]);
+        let second = write_one_chunk(&bson::doc! { "b": 3i32, "c": 4i32 }, 2, 0, &[]);
+        let mut bytes = std::fs::read(&first).unwrap();
+        bytes.extend(std::fs::read(&second).unwrap());
+        let path = std::env::temp_dir().join(format!("ftdc-rs-filter-{}.bin", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+
+        let series = Archive::open(&path)
+            .unwrap()
+            .decode(Some(regex::Regex::new("^c$").unwrap()))
+            .unwrap();
+        let names: Vec<&str> = series.keys().map(String::as_str).collect();
+        assert_eq!(names, ["c"]);
+        assert_eq!(
+            series.get("c").map(Vec::as_slice),
+            Some([None, Some(4)].as_slice())
+        );
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+        let _ = std::fs::remove_file(&path);
     }
 }
