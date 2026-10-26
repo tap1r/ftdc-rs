@@ -97,12 +97,42 @@ pub struct MetadataDelta {
 ///
 /// `id` is the wrapper `_id`: the time the chunk was opened. The reference
 /// sample inside the blob is the first row of the chunk, and this timestamp
-/// is the chunk's own clock. `bytes` is the BinData payload, whose first four
+/// is the chunk's own clock. It is not the per-sample clock. When the
+/// reference document has a datetime such as `start`, that field is an
+/// ordinary metric column. `bytes` is the BinData payload, whose first four
 /// bytes are the uncompressed size. See `decode`.
 #[derive(Debug, Clone)]
 pub struct MetricChunk {
     pub id: Option<Bson>,
     pub bytes: Vec<u8>,
+}
+
+/// Where one metric chunk sits in the decoded series.
+///
+/// `id` is the type 1 wrapper `_id`, the time the server opened the chunk.
+/// `rows` is how many samples that chunk appended. The header's
+/// `sample_count` counts deltas, not rows, so the height is
+/// `sample_count + 1`: the reference sample, then one reconstructed sample
+/// per delta. Every column of the chunk has this height. A `keep` predicate
+/// that drops a column does not change it. The row cursor still advances,
+/// which is why a metric that first appears in a later chunk is null for
+/// these rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkSpan {
+    pub id: Option<Bson>,
+    pub rows: usize,
+}
+
+/// The metric columns and the chunk spans that produced them.
+///
+/// `columns` is one series per metric that `keep` accepted, in the order
+/// names were first seen. `chunks` is one span per type 1 document, in file
+/// order, including a chunk whose every metric was rejected. The two are
+/// the same decode: the spans are not a second pass over the blobs.
+#[derive(Debug, Clone)]
+pub struct Decoded {
+    pub columns: IndexMap<String, MetricColumn>,
+    pub chunks: Vec<ChunkSpan>,
 }
 
 /// One FTDC archive, read once.
@@ -279,42 +309,55 @@ impl Archive {
     ///
     /// Metric names come back in the order they were first seen. That is
     /// the reference document's field order, then metrics introduced by
-    /// later chunks.
-    pub fn decode(
-        &self,
-        mut keep: impl FnMut(&str) -> bool,
-    ) -> Result<IndexMap<String, MetricColumn>, FileDecoderError> {
+    /// later chunks. [`Decoded::chunks`] records each type 1 wrapper's
+    /// `_id` and the number of rows that chunk appended.
+    pub fn decode(&self, mut keep: impl FnMut(&str) -> bool) -> Result<Decoded, FileDecoderError> {
         let mut merged: IndexMap<String, MetricColumn> = IndexMap::new();
         // How many samples the chunks already appended account for.
         // A metric that first appears later is null for these rows.
         let mut rows = 0usize;
+        let mut spans = Vec::with_capacity(self.chunks.len());
         for chunk in &self.chunks {
             let inflated = inflate_owned(&chunk.bytes)?;
             let (height, columns) = decode_one_chunk(inflated, &mut keep)?;
             append_chunk(&mut merged, &mut rows, columns, height)?;
+            // `height` is the chunk's row count, not the number of columns
+            // `keep` stored. The wrapper `_id` is the chunk clock. It is
+            // copied here so the sidecar can name the span without a second
+            // walk of the file.
+            spans.push(ChunkSpan {
+                id: chunk.id.clone(),
+                rows: height,
+            });
         }
-        Ok(merged)
+        Ok(Decoded {
+            columns: merged,
+            chunks: spans,
+        })
     }
 
-    /// Write the metadata sidecar for `metrics`.
+    /// Write the metadata sidecar for one decode.
     ///
-    /// `metrics` and `metricTypes` follow the column order. `_id` is relaxed
-    /// extended JSON. `count` on a delta is the encoder generation. This
-    /// does not write Parquet and does not need the `parquet` feature.
+    /// `metrics` and `metricTypes` follow the column order. `chunks` is one
+    /// `{_id, rows}` object per type 1 document, in file order. `_id` is
+    /// relaxed extended JSON. `rows` is `sample_count + 1`. `count` on a
+    /// delta is the encoder generation. This does not write Parquet and
+    /// does not need the `parquet` feature.
     pub fn write_sidecar(
         &self,
-        metrics: &IndexMap<String, MetricColumn>,
+        decoded: &Decoded,
         path: impl AsRef<Path>,
     ) -> Result<(), FileDecoderError> {
         let path = path.as_ref();
-        let mut body = self.sidecar_preamble();
+        let mut body = self.sidecar_preamble(&decoded.chunks);
         let Some(object) = body.as_object_mut() else {
             return Err(FileDecoderError::format(format!(
                 "metadata sidecar preamble is not a JSON object"
             )));
         };
-        let names: Vec<&str> = metrics.keys().map(String::as_str).collect();
-        let kinds: serde_json::Map<String, serde_json::Value> = metrics
+        let names: Vec<&str> = decoded.columns.keys().map(String::as_str).collect();
+        let kinds: serde_json::Map<String, serde_json::Value> = decoded
+            .columns
             .iter()
             .map(|(name, column)| {
                 (
@@ -347,7 +390,10 @@ impl Archive {
     /// `metadata`, when set, is the path of the sidecar. It receives every
     /// type 0 wrapper and every type 2 wrapper: `_id`, and for a delta the
     /// generation `count`, plus the embedded `doc` as relaxed extended JSON.
-    /// `keep` selects metric names; `|_| true` keeps every column.
+    /// It also receives one `chunks` entry per type 1 document: the wrapper
+    /// `_id` and the row count that chunk appended. `keep` selects metric
+    /// names; `|_| true` keeps every column. The column values are the
+    /// decoded series. Recording the spans does not change them.
     ///
     /// Available with the `parquet` feature, which is on by default.
     #[cfg(feature = "parquet")]
@@ -358,23 +404,27 @@ impl Archive {
         keep: impl FnMut(&str) -> bool,
     ) -> Result<(), FileDecoderError> {
         let archive = Archive::open(input_file_name)?;
-        let metrics = archive.decode(keep)?;
+        let decoded = archive.decode(keep)?;
         if let Some(path) = metadata {
-            archive.write_sidecar(&metrics, path)?;
+            archive.write_sidecar(&decoded, path)?;
         }
-        write_parquet(metrics, output_file_name.as_ref())
+        write_parquet(decoded.columns, output_file_name.as_ref())
     }
 
-    /// Sidecar object without the `metrics` list.
+    /// Sidecar object without the column lists.
     ///
-    /// The column names are inserted after the DataFrame exists, so they
-    /// follow the same order as the Parquet file. `_id` is relaxed extended
-    /// JSON (`$date` for the timestamp the server writes). `doc` is the
-    /// embedded collector document, also relaxed extended JSON.
-    pub(crate) fn sidecar_preamble(&self) -> serde_json::Value {
+    /// [`Archive::write_sidecar`] inserts `metrics` and `metricTypes` from
+    /// the decoded map, in that map's order, before any Parquet file is
+    /// written. `chunks` is one object per type 1 document, in file order.
+    /// `_id` is relaxed extended JSON (`$date` for the timestamp the server
+    /// writes). `rows` is the number of samples that chunk appended. `doc`
+    /// on a metadata record is the embedded collector document, also relaxed
+    /// extended JSON.
+    pub(crate) fn sidecar_preamble(&self, chunks: &[ChunkSpan]) -> serde_json::Value {
         serde_json::json!({
             "metadata": self.metadata.iter().map(metadata_json).collect::<Vec<_>>(),
             "metadataDeltas": self.metadata_deltas.iter().map(delta_json).collect::<Vec<_>>(),
+            "chunks": chunks.iter().map(chunk_json).collect::<Vec<_>>(),
             "documentCount": self.document_count,
             "skippedChunkTypes": self.skipped_chunk_types,
         })
@@ -404,6 +454,17 @@ fn delta_json(delta: &MetadataDelta) -> serde_json::Value {
         "_id": id_json(&delta.id),
         "count": delta.count,
         "doc": relaxed_extended_json(&Bson::Document(delta.doc.clone())),
+    })
+}
+
+/// One metric chunk in the sidecar.
+///
+/// `_id` is the type 1 wrapper timestamp, not a field from inside the
+/// reference sample. `rows` is the height appended for that chunk.
+fn chunk_json(chunk: &ChunkSpan) -> serde_json::Value {
+    serde_json::json!({
+        "_id": id_json(&chunk.id),
+        "rows": chunk.rows,
     })
 }
 
