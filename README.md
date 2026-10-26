@@ -30,8 +30,8 @@ a directory is that one file.
 The process exits with a non-zero status when a file cannot be read or
 written, when `--filter` is not a regular expression, or when a directory
 contains no `metrics.*` files. A chunk type this build does not know is
-skipped and reported at `warn` (the default log level). Set `RUST_LOG` to
-raise or quiet that.
+skipped and recorded. The `ftdc-rs` binary logs each one at `warn` (the
+default log level). Set `RUST_LOG` to raise or quiet that.
 
 `--metadata` writes relaxed extended JSON. `metadata` is every type 0
 wrapper (`_id` and `doc`) and `metadataDeltas` is every type 2 wrapper
@@ -56,8 +56,10 @@ values stay the `u64` bit patterns those rules produce.
 `Archive::decode` takes a predicate, `|name| ...`, and passes every
 name through it once while that metric's deltas are consumed. The
 `ftdc-rs` binary turns `--filter` into that predicate. Polars is the
-`parquet` feature, on by default. Without it the library still opens
-an archive, decodes the columns, and writes the sidecar.
+`parquet` feature, on by default. `clap`, `regex`, and `env_logger` are
+the `cli` feature, also on by default, and are not built for a library
+decode. Without `parquet` the library still opens an archive, decodes
+the columns, and writes the sidecar.
 
 ## Example
 
