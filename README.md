@@ -37,7 +37,11 @@ raise or quiet that.
 wrapper (`_id` and `doc`) and `metadataDeltas` is every type 2 wrapper
 (`_id`, `count`, and `doc`), in file order. `count` is the periodic
 metadata encoder's generation: `0` is a full sample, and a later number
-is a sparse diff. `chunks` is every type 1 wrapper: `_id` is the time
+is a sparse diff. The sidecar stores those diffs. `reconstruct_metadata`
+rebuilds the sample after each one: `count == 0` replaces the snapshot,
+and a later count merges one collector level deep. A nested document
+inside a collector is replaced as a whole. The server does not do this
+merge when it writes the file. `chunks` is every type 1 wrapper: `_id` is the time
 the chunk was opened, and `rows` is `sample_count + 1`, the reference
 sample plus one row per delta. That `_id` is not the per-sample clock
 (`start` is an ordinary datetime metric when the collector wrote one).

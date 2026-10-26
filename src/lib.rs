@@ -9,6 +9,9 @@
 //!   is kept with the embedded `doc`. A type this build does not know is
 //!   skipped. The sidecar's `chunks` array is each type 1 `_id` and the
 //!   number of rows that chunk appended (`sample_count + 1`).
+//!   [`reconstruct_metadata`] rebuilds the periodic sample from the type 2
+//!   diffs. `count == 0` replaces the snapshot. A later count merges one
+//!   collector level deep. The sidecar keeps the raw diffs.
 //! * `decode` inflates a metric chunk and rebuilds each series from the
 //!   reference sample plus the delta block.
 //! * `extract` walks the reference document and keeps the numeric fields
@@ -31,7 +34,10 @@ mod export;
 mod extract;
 mod varint;
 
-pub use archive::{Archive, ChunkSpan, Decoded, MetadataDelta, MetadataDocument, MetricChunk};
+pub use archive::{
+    Archive, ChunkSpan, Decoded, MetadataDelta, MetadataDocument, MetricChunk,
+    ReconstructedMetadata, reconstruct_metadata,
+};
 pub use errors::FileDecoderError;
 pub use extract::{MetricColumn, MetricKind};
 
@@ -41,7 +47,7 @@ pub(crate) use extract::decimal_text_to_i64;
 #[cfg(test)]
 
 mod tests {
-    use crate::{Archive, MetricColumn, MetricKind};
+    use crate::{Archive, MetadataDelta, MetricColumn, MetricKind, reconstruct_metadata};
     use indexmap::IndexMap;
 
     #[test]
@@ -1236,6 +1242,183 @@ mod tests {
 
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&parquet);
+    }
+
+    /// Type 2 `count == 0` is a full sample. A later count is a sparse diff
+    /// merged one collector level deep. The sidecar keeps the raw diff.
+    ///
+    /// The nested document `getParameter.nested` is replaced wholesale, so
+    /// `nested.b` disappears while `getParameter.a` stays. A later full
+    /// sample drops `getParameter` entirely. The README merge, which ignores
+    /// `count`, would have kept it.
+    #[test]
+    fn metadata_deltas_reconstruct_one_collector_level_and_reset_on_zero() {
+        let full = MetadataDelta {
+            id: Some(bson::Bson::DateTime(bson::DateTime::from_millis(1))),
+            count: 0,
+            doc: bson::doc! {
+                "start": bson::DateTime::from_millis(10),
+                "getParameter": {
+                    "a": 1i32,
+                    "b": 2i32,
+                    "nested": { "a": 1i32, "b": 2i32 },
+                },
+                "end": bson::DateTime::from_millis(11),
+            },
+        };
+        let diff = MetadataDelta {
+            id: Some(bson::Bson::DateTime(bson::DateTime::from_millis(2))),
+            count: 1,
+            doc: bson::doc! {
+                "start": bson::DateTime::from_millis(20),
+                "getParameter": {
+                    "b": 3i32,
+                    "nested": { "a": 9i32 },
+                },
+                "end": bson::DateTime::from_millis(21),
+            },
+        };
+        let reset = MetadataDelta {
+            id: Some(bson::Bson::DateTime(bson::DateTime::from_millis(3))),
+            count: 0,
+            doc: bson::doc! {
+                "start": bson::DateTime::from_millis(30),
+                "getClusterParameter": { "x": 1i32 },
+                "end": bson::DateTime::from_millis(31),
+            },
+        };
+
+        let samples = reconstruct_metadata(&[full.clone(), diff.clone(), reset]);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0].count, 0);
+        assert_eq!(samples[1].count, 1);
+        assert_eq!(
+            samples[1].id,
+            Some(bson::Bson::DateTime(bson::DateTime::from_millis(2)))
+        );
+
+        let merged = samples[1].doc.get_document("getParameter").unwrap();
+        assert_eq!(merged.get_i32("a").unwrap(), 1);
+        assert_eq!(merged.get_i32("b").unwrap(), 3);
+        let nested = merged.get_document("nested").unwrap();
+        assert_eq!(nested.get_i32("a").unwrap(), 9);
+        assert!(nested.get("b").is_none());
+        assert_eq!(
+            samples[1]
+                .doc
+                .get_datetime("start")
+                .unwrap()
+                .timestamp_millis(),
+            20
+        );
+        assert_eq!(
+            samples[1]
+                .doc
+                .get_datetime("end")
+                .unwrap()
+                .timestamp_millis(),
+            21
+        );
+
+        assert!(samples[2].doc.get("getParameter").is_none());
+        assert_eq!(
+            samples[2]
+                .doc
+                .get_document("getClusterParameter")
+                .unwrap()
+                .get_i32("x")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            samples[2]
+                .doc
+                .get_datetime("start")
+                .unwrap()
+                .timestamp_millis(),
+            30
+        );
+
+        // A collector that is no longer a document replaces the key. A first
+        // delta with a non-zero count merges onto an empty document.
+        let replaced = MetadataDelta {
+            id: None,
+            count: 2,
+            doc: bson::doc! { "getParameter": 7i32 },
+        };
+        let after_replace = reconstruct_metadata(&[full, diff, replaced]);
+        assert_eq!(after_replace[2].doc.get_i32("getParameter").unwrap(), 7);
+        let leading = reconstruct_metadata(&[MetadataDelta {
+            id: None,
+            count: 4,
+            doc: bson::doc! { "getParameter": { "a": 1i32 } },
+        }]);
+        assert_eq!(
+            leading[0]
+                .doc
+                .get_document("getParameter")
+                .unwrap()
+                .get_i32("a")
+                .unwrap(),
+            1
+        );
+        assert!(reconstruct_metadata(&[]).is_empty());
+
+        // The sidecar still stores the sparse diff. `a` was not in it.
+        let mut bytes = Vec::new();
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(1),
+            "type": 2i32,
+            "count": 0i32,
+            "doc": {
+                "getParameter": { "a": 1i32, "b": 2i32 }
+            }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+        bson::doc! {
+            "_id": bson::DateTime::from_millis(2),
+            "type": 2i32,
+            "count": 1i32,
+            "doc": {
+                "getParameter": { "b": 3i32 }
+            }
+        }
+        .to_writer(&mut bytes)
+        .unwrap();
+        let input = std::env::temp_dir().join(format!("ftdc-rs-recon-{}.bin", std::process::id()));
+        let sidecar = std::env::temp_dir().join(format!(
+            "ftdc-rs-recon-{}.metadata.json",
+            std::process::id()
+        ));
+        std::fs::write(&input, bytes).unwrap();
+        let archive = Archive::open(&input).unwrap();
+        let decoded = archive.decode(|_| true).unwrap();
+        archive.write_sidecar(&decoded, &sidecar).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert!(
+            json["metadataDeltas"][1]["doc"]["getParameter"]
+                .get("a")
+                .is_none()
+        );
+        assert_eq!(
+            json["metadataDeltas"][1]["doc"]["getParameter"]["b"],
+            serde_json::json!(3)
+        );
+        let rebuilt = reconstruct_metadata(&archive.metadata_deltas);
+        assert_eq!(
+            rebuilt[1]
+                .doc
+                .get_document("getParameter")
+                .unwrap()
+                .get_i32("a")
+                .unwrap(),
+            1
+        );
+
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     #[cfg(feature = "parquet")]
