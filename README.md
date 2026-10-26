@@ -45,8 +45,9 @@ sample plus one row per delta. That `_id` is not the per-sample clock
 `skippedChunkTypes` lists type numbers that were skipped. `metrics` is
 the Parquet column names, in field order. `metricTypes` names the
 compressor rule for each column (`int`, `double`, `decimal`, `bool`,
-`date`, `timestampSeconds`, `timestampIncrement`). The column values
-stay the `u64` bit patterns those rules produce.
+`date`, `timestampSeconds`, `timestampIncrement`). The same string is
+stored on each Parquet field under the key `metricKind`. The column
+values stay the `u64` bit patterns those rules produce.
 
 `Archive::decode` takes a predicate, `|name| ...`, and passes every
 name through it once while that metric's deltas are consumed. The
