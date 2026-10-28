@@ -78,14 +78,17 @@ pub struct MetadataDocument {
 /// current one, one collector level deep. Unchanged collectors are omitted.
 /// `count` is that encoder's generation, not a count of metric samples:
 ///
-/// * `0` — tracking reset, and `doc` is a full sample
+/// * `0` — tracking reset, and `doc` is a full sample. Replaying this with
+///   a merge would keep collectors the reset dropped, so it replaces the
+///   snapshot.
 /// * `1`, `2`, ... — a sparse diff, and `count` is how many diffs have been
-///   emitted since the reset
+///   emitted since the reset. Unchanged collectors are omitted. Inside a
+///   changed collector, only `start`, `end`, and the fields that changed
+///   are present.
 ///
-/// Reconstructing the parameters at a later chunk means merging `doc` values
-/// in order, field by field inside each collector. The server does not do
-/// that merge when it writes the file. The archive keeps the diffs, the
-/// generation, and the wrapper `_id` so a caller can.
+/// [`reconstruct_metadata`] turns this sequence into one sample per delta.
+/// The server does not do that when it writes the file. The archive keeps
+/// the diffs.
 #[derive(Debug, Clone)]
 pub struct MetadataDelta {
     pub id: Option<Bson>,
@@ -455,6 +458,86 @@ fn delta_json(delta: &MetadataDelta) -> serde_json::Value {
         "count": delta.count,
         "doc": relaxed_extended_json(&Bson::Document(delta.doc.clone())),
     })
+}
+
+/// One sample of periodic metadata, after applying the deltas in order.
+///
+/// `id` and `count` are copied from the delta that produced this sample,
+/// so the vec lines up with [`Archive::metadata_deltas`]. `doc` is the
+/// reconstructed collector sample, not the raw diff. `count == 0` replaced
+/// the previous sample. A later count merged one collector level deep.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconstructedMetadata {
+    pub id: Option<Bson>,
+    pub count: i64,
+    pub doc: Document,
+}
+
+/// Rebuild the periodic metadata sample after each type 2 delta.
+///
+/// The server's encoder is not fully recursive. A sample is two levels:
+/// top-level `start` and `end`, plus one sub-document per collector. The
+/// file stores diffs. The README's `reconstruct(docs)` merges every
+/// document into one snapshot and does not look at `count`. A `count == 0`
+/// document is a full sample written because tracking reset (the field-name
+/// sequence changed, or there was no previous document). Merging that onto
+/// the previous snapshot would keep a collector the reset removed. This
+/// function therefore replaces the snapshot when `count == 0`.
+///
+/// A `count > 0` diff is sparse. Top-level values that are not documents
+/// (`start`, `end`, or a collector that changed type) are replaced. A
+/// collector document is merged field by field, in the diff's field order.
+/// A nested document inside the collector is one field, so it is replaced
+/// wholesale: the encoder did not descend into it, and fields it omitted
+/// are gone. Keys the diff does not mention are left alone. They were
+/// unchanged, not deleted. If the first delta has `count != 0`, the merge
+/// starts from an empty document.
+///
+/// The returned samples include a delta's `_id` and `count`. This does not
+/// write the merged view into the sidecar. The sidecar keeps the raw diffs.
+pub fn reconstruct_metadata(deltas: &[MetadataDelta]) -> Vec<ReconstructedMetadata> {
+    let mut snapshot = Document::new();
+    let mut samples = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        if delta.count == 0 {
+            snapshot = delta.doc.clone();
+        } else {
+            merge_collector_level(&mut snapshot, &delta.doc);
+        }
+        samples.push(ReconstructedMetadata {
+            id: delta.id.clone(),
+            count: delta.count,
+            doc: snapshot.clone(),
+        });
+    }
+    samples
+}
+
+/// Merge one type 2 diff into `snapshot`, one collector level deep.
+///
+/// A document value is a collector when the snapshot already holds a
+/// document under that key. Its fields are copied, and the walk stops.
+/// Anything else replaces the key. A missing key is an insert. A collector
+/// that arrived as an int, or an int that arrived as a collector, replaces
+/// the previous value rather than panicking.
+fn merge_collector_level(snapshot: &mut Document, diff: &Document) {
+    for (key, value) in diff {
+        let collector = matches!(value, Bson::Document(_))
+            && matches!(snapshot.get(key), Some(Bson::Document(_)));
+        if collector {
+            let Bson::Document(incoming) = value else {
+                continue;
+            };
+            let existing = snapshot
+                .get_document_mut(key)
+                .expect("collector was a document");
+            for (child_key, child_value) in incoming {
+                existing.insert(child_key, child_value.clone());
+            }
+        } else {
+            snapshot.insert(key, value.clone());
+        }
+    }
 }
 
 /// One metric chunk in the sidecar.
