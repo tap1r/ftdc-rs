@@ -284,9 +284,9 @@ impl Archive {
                             // unknown type are still valid samples, and
                             // failing here is how a whole archive used
                             // to be discarded because of one document.
-                            log::warn!(
-                                "skipping unrecognised FTDC chunk type {other}; metric chunks around it are still read"
-                            );
+                            // The type number is remembered. The binary
+                            // logs it after open. This library does not
+                            // pull in a logger to say so.
                             archive.skipped_chunk_types.push(other);
                         }
                     }
@@ -407,9 +407,24 @@ impl Archive {
         keep: impl FnMut(&str) -> bool,
     ) -> Result<(), FileDecoderError> {
         let archive = Archive::open(input_file_name)?;
-        let decoded = archive.decode(keep)?;
+        archive.write_parquet(output_file_name, metadata, keep)
+    }
+
+    /// Decode this archive and write Parquet, and the sidecar when asked.
+    ///
+    /// [`Archive::open`] has already run, so the caller can read
+    /// [`Archive::skipped_chunk_types`] first. The `ftdc-rs` binary logs
+    /// each of those before calling this. Decoding does not log.
+    #[cfg(feature = "parquet")]
+    pub fn write_parquet(
+        &self,
+        output_file_name: impl AsRef<Path>,
+        metadata: Option<&Path>,
+        keep: impl FnMut(&str) -> bool,
+    ) -> Result<(), FileDecoderError> {
+        let decoded = self.decode(keep)?;
         if let Some(path) = metadata {
-            archive.write_sidecar(&decoded, path)?;
+            self.write_sidecar(&decoded, path)?;
         }
         write_parquet(decoded.columns, output_file_name.as_ref())
     }

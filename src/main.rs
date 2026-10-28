@@ -162,7 +162,24 @@ fn main() -> ExitCode {
             out_file.display()
         );
 
-        match Archive::write_to_parquet(file_name, &out_file, metadata.as_deref(), |name| {
+        let archive = match Archive::open(file_name) {
+            Ok(archive) => archive,
+            Err(error) => {
+                log::error!("failed to write {}: {error}", out_file.display());
+                failed = true;
+                continue;
+            }
+        };
+        // Unknown chunk types were skipped while opening. The samples
+        // around them are still decoded. Log it here, not inside the
+        // library, so a decode without the CLI crates stays quiet.
+        for other in &archive.skipped_chunk_types {
+            log::warn!(
+                "skipping unrecognised FTDC chunk type {other}; metric chunks around it are still read"
+            );
+        }
+
+        match archive.write_parquet(&out_file, metadata.as_deref(), |name| {
             filter
                 .as_ref()
                 .map(|expression| expression.is_match(name))

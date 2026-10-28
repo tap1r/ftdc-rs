@@ -21,7 +21,10 @@
 //!   exist is null. Each field's metadata key `metricKind` is the same
 //!   string the sidecar writes in `metricTypes`. The cells stay `u64`.
 //!   That module is behind the `parquet` feature, which is on by default.
-//!   Decoding and the metadata sidecar do not need it.
+//!   Decoding and the metadata sidecar do not need it. `clap`, `regex`,
+//!   and `env_logger` are the `cli` feature used by the binary. A library
+//!   decode does not build them, and it does not log a skipped chunk type.
+//!   The type number is on [`Archive::skipped_chunk_types`].
 //!
 //! Chunks are inflated and appended one at a time, in file order, which
 //! is the order of the samples.
