@@ -15,8 +15,10 @@
 //!   the server compressor keeps.
 //! * `varint` reads one unsigned LEB128 integer from the delta block.
 //! * `export` writes the aligned series to Parquet. A sample that did not
-//!   exist is null. That module is behind the `parquet` feature, which is
-//!   on by default. Decoding and the metadata sidecar do not need it.
+//!   exist is null. Each field's metadata key `metricKind` is the same
+//!   string the sidecar writes in `metricTypes`. The cells stay `u64`.
+//!   That module is behind the `parquet` feature, which is on by default.
+//!   Decoding and the metadata sidecar do not need it.
 //!
 //! Chunks are inflated and appended one at a time, in file order, which
 //! is the order of the samples.
@@ -1195,5 +1197,56 @@ mod tests {
         let _ = std::fs::remove_file(&first);
         let _ = std::fs::remove_file(&second);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The Parquet field records the compressor rule. The cells stay `u64`.
+    ///
+    /// `metricKind` is the same string `metricTypes` uses. A bool is 0 or 1,
+    /// a datetime is its milliseconds, and an int is the integer. None of
+    /// those columns is written as a Parquet bool, timestamp, or float.
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn parquet_field_metadata_names_the_metric_kind() {
+        let input = write_one_chunk(
+            &bson::doc! {
+                "n": 1i32,
+                "flag": true,
+                "when": bson::DateTime::from_millis(5),
+            },
+            3,
+            0,
+            &[],
+        );
+        let parquet =
+            std::env::temp_dir().join(format!("ftdc-rs-kind-meta-{}.parquet", std::process::id()));
+        Archive::write_to_parquet(&input, &parquet, None, |_| true).unwrap();
+
+        use polars::prelude::SerReader;
+        let mut file = std::fs::File::open(&parquet).unwrap();
+        let mut reader = polars::prelude::ParquetReader::new(&mut file);
+        let schema = reader.schema().unwrap();
+        assert_eq!(parquet_metric_kind(&schema, "n"), "int");
+        assert_eq!(parquet_metric_kind(&schema, "flag"), "bool");
+        assert_eq!(parquet_metric_kind(&schema, "when"), "date");
+
+        let frame = reader.finish().unwrap();
+        assert_eq!(frame.column("n").unwrap().u64().unwrap().get(0), Some(1));
+        assert_eq!(frame.column("flag").unwrap().u64().unwrap().get(0), Some(1));
+        assert_eq!(frame.column("when").unwrap().u64().unwrap().get(0), Some(5));
+
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&parquet);
+    }
+
+    #[cfg(feature = "parquet")]
+    fn parquet_metric_kind(schema: &polars::prelude::ArrowSchema, name: &str) -> String {
+        let field = schema.get(name).unwrap_or_else(|| panic!("missing {name}"));
+        field
+            .metadata
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} has no field metadata"))
+            .get("metricKind")
+            .unwrap_or_else(|| panic!("{name} has no metricKind"))
+            .to_string()
     }
 }
