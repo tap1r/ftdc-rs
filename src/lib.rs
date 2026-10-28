@@ -7,7 +7,8 @@
 //!   Type 0 is metadata, type 1 is a compressed metric chunk, type 2 is a
 //!   periodic metadata delta. The wrapper `_id` (and, for type 2, `count`)
 //!   is kept with the embedded `doc`. A type this build does not know is
-//!   skipped.
+//!   skipped. The sidecar's `chunks` array is each type 1 `_id` and the
+//!   number of rows that chunk appended (`sample_count + 1`).
 //! * `decode` inflates a metric chunk and rebuilds each series from the
 //!   reference sample plus the delta block.
 //! * `extract` walks the reference document and keeps the numeric fields
@@ -28,7 +29,7 @@ mod export;
 mod extract;
 mod varint;
 
-pub use archive::{Archive, MetadataDelta, MetadataDocument, MetricChunk};
+pub use archive::{Archive, ChunkSpan, Decoded, MetadataDelta, MetadataDocument, MetricChunk};
 pub use errors::FileDecoderError;
 pub use extract::{MetricColumn, MetricKind};
 
@@ -50,7 +51,11 @@ mod tests {
     }
 
     fn open_decoded(path: impl AsRef<std::path::Path>) -> IndexMap<String, MetricColumn> {
-        Archive::open(path).unwrap().decode(|_| true).unwrap()
+        Archive::open(path)
+            .unwrap()
+            .decode(|_| true)
+            .unwrap()
+            .columns
     }
 
     /// A MongoDB 7+ archive starts with metadata, then a type 2 delta,
@@ -178,7 +183,8 @@ mod tests {
     }
 
     /// `tail` is appended to the delta block before zlib. A non-empty tail
-    /// is a chunk whose deltas do not end on the last sample.
+    /// is a chunk whose deltas do not end on the last sample. The wrapper
+    /// `_id` is millis 0.
     fn write_chunk(
         reference: &bson::Document,
         metric_count: u32,
@@ -186,6 +192,31 @@ mod tests {
         deltas: &[u64],
         tail: &[u8],
     ) -> std::path::PathBuf {
+        let file = metric_chunk_bytes(reference, metric_count, sample_count, deltas, tail, 0);
+
+        // Unique per call. Several tests build a chunk with the same
+        // sample_count, and `cargo test` runs them on more than one thread.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CHUNK_SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ftdc-rs-chunk-{}-{}.bin",
+            std::process::id(),
+            CHUNK_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, file).unwrap();
+        path
+    }
+
+    /// One type 1 wrapper. `id_millis` is the chunk's open time, the value
+    /// the sidecar records as `_id`. It is not a field of `reference`.
+    fn metric_chunk_bytes(
+        reference: &bson::Document,
+        metric_count: u32,
+        sample_count: u32,
+        deltas: &[u64],
+        tail: &[u8],
+        id_millis: i64,
+    ) -> Vec<u8> {
         use std::io::Write;
 
         let mut payload = Vec::new();
@@ -205,7 +236,7 @@ mod tests {
         blob.extend(compressed);
 
         let wrapper = bson::doc! {
-            "_id": bson::DateTime::from_millis(0),
+            "_id": bson::DateTime::from_millis(id_millis),
             "type": 1i32,
             "data": bson::Binary {
                 subtype: bson::spec::BinarySubtype::Generic,
@@ -214,18 +245,7 @@ mod tests {
         };
         let mut file = Vec::new();
         wrapper.to_writer(&mut file).unwrap();
-
-        // Unique per call. Several tests build a chunk with the same
-        // sample_count, and `cargo test` runs them on more than one thread.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CHUNK_SEQ: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ftdc-rs-chunk-{}-{}.bin",
-            std::process::id(),
-            CHUNK_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, file).unwrap();
-        path
+        file
     }
 
     /// The walkthrough in the server FTDC README, plus the two edges the
@@ -744,8 +764,8 @@ mod tests {
         #[cfg(not(feature = "parquet"))]
         {
             let archive = Archive::open(&input).unwrap();
-            let metrics = archive.decode(|_| true).unwrap();
-            archive.write_sidecar(&metrics, &sidecar).unwrap();
+            let decoded = archive.decode(|_| true).unwrap();
+            archive.write_sidecar(&decoded, &sidecar).unwrap();
         }
 
         let json: serde_json::Value =
@@ -769,6 +789,11 @@ mod tests {
         assert_eq!(json["skippedChunkTypes"], serde_json::json!([9]));
         assert_eq!(json["metrics"], serde_json::json!(["n"]));
         assert_eq!(json["metricTypes"]["n"], "int");
+        // sample_count 0 still appends the reference row. The wrapper
+        // `_id` is millis 0, written the same way as the metadata `_id`.
+        assert_eq!(json["chunks"].as_array().unwrap().len(), 1);
+        assert_eq!(json["chunks"][0]["rows"], serde_json::json!(1));
+        assert!(json["chunks"][0]["_id"]["$date"].is_string());
 
         #[cfg(feature = "parquet")]
         {
@@ -783,6 +808,90 @@ mod tests {
         let _ = std::fs::remove_file(&chunk);
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&parquet);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// The sidecar names each metric chunk by the time it was opened.
+    ///
+    /// `rows` is `sample_count + 1`. The first chunk has three deltas, so
+    /// four rows; the second has none, so the reference row only. `start`
+    /// inside the reference document is a datetime metric. The chunk `_id`
+    /// is a different clock and is not that column. The `n` series is the
+    /// concatenation of the two chunks.
+    #[test]
+    fn sidecar_records_chunk_open_time_and_row_count() {
+        let first_id = 1_700_000_000_000;
+        let second_id = 1_700_000_001_000;
+        let mut bytes = metric_chunk_bytes(
+            &bson::doc! { "n": 1i32, "start": bson::DateTime::from_millis(10) },
+            2,
+            3,
+            &[1, 1, 1, 0, 0, 0],
+            &[],
+            first_id,
+        );
+        bytes.extend(metric_chunk_bytes(
+            &bson::doc! { "n": 9i32, "start": bson::DateTime::from_millis(50) },
+            2,
+            0,
+            &[],
+            &[],
+            second_id,
+        ));
+
+        let dir = std::env::temp_dir();
+        let input = dir.join(format!("ftdc-rs-spans-{}.bin", std::process::id()));
+        let sidecar = dir.join(format!(
+            "ftdc-rs-spans-{}.metadata.json",
+            std::process::id()
+        ));
+        std::fs::write(&input, bytes).unwrap();
+
+        let archive = Archive::open(&input).unwrap();
+        let decoded = archive.decode(|_| true).unwrap();
+        assert_eq!(
+            decoded
+                .columns
+                .get("n")
+                .map(|column| column.values.as_slice()),
+            Some([Some(1), Some(2), Some(3), Some(4), Some(9)].as_slice())
+        );
+        assert_eq!(
+            decoded
+                .columns
+                .get("start")
+                .map(|column| column.values.as_slice()),
+            Some([Some(10), Some(10), Some(10), Some(10), Some(50)].as_slice())
+        );
+        assert_eq!(
+            decoded
+                .chunks
+                .iter()
+                .map(|span| span.rows)
+                .collect::<Vec<_>>(),
+            vec![4, 1]
+        );
+
+        archive.write_sidecar(&decoded, &sidecar).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(json["chunks"].as_array().unwrap().len(), 2);
+        assert_eq!(json["chunks"][0]["rows"], serde_json::json!(4));
+        assert_eq!(json["chunks"][1]["rows"], serde_json::json!(1));
+        let first_date = bson::DateTime::from_millis(first_id)
+            .try_to_rfc3339_string()
+            .unwrap();
+        let second_date = bson::DateTime::from_millis(second_id)
+            .try_to_rfc3339_string()
+            .unwrap();
+        assert_eq!(json["chunks"][0]["_id"]["$date"], first_date);
+        assert_eq!(json["chunks"][1]["_id"]["$date"], second_date);
+        assert_ne!(json["chunks"][0]["_id"], json["chunks"][1]["_id"]);
+        // The per-sample clock stayed a column. It is not the chunk `_id`.
+        assert_eq!(json["metrics"], serde_json::json!(["n", "start"]));
+        assert_eq!(json["metricTypes"]["start"], "date");
+
+        let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&sidecar);
     }
 
@@ -843,8 +952,8 @@ mod tests {
         #[cfg(not(feature = "parquet"))]
         {
             let archive = Archive::open(&input).unwrap();
-            let metrics = archive.decode(|_| true).unwrap();
-            archive.write_sidecar(&metrics, &sidecar).unwrap();
+            let decoded = archive.decode(|_| true).unwrap();
+            archive.write_sidecar(&decoded, &sidecar).unwrap();
         }
 
         #[cfg(feature = "parquet")]
@@ -1030,15 +1139,26 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ftdc-rs-filter-{}.bin", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
 
-        let series = Archive::open(&path)
+        let decoded = Archive::open(&path)
             .unwrap()
             .decode(|name| name == "c")
             .unwrap();
+        let series = &decoded.columns;
         let names: Vec<&str> = series.keys().map(String::as_str).collect();
         assert_eq!(names, ["c"]);
         assert_eq!(
             series.get("c").map(|column| column.values.as_slice()),
             Some([None, Some(4)].as_slice())
+        );
+        // Dropping `a` and `b` does not shrink the chunk. Each chunk still
+        // contributes its reference row, which is why `c` has a leading null.
+        assert_eq!(
+            decoded
+                .chunks
+                .iter()
+                .map(|span| span.rows)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
         );
         let _ = std::fs::remove_file(&first);
         let _ = std::fs::remove_file(&second);

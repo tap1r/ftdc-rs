@@ -17,8 +17,10 @@
 //! `$timestamp`). Integers and strings stay JSON values. `count` is the
 //! delta encoder's generation, not a sample index. An earlier sidecar kept
 //! only the inner `doc`, and before that only the last document of each
-//! kind, rendered with `Document`'s `Display`. `metricTypes` names the
-//! compressor rule for each column. The Parquet values stay `u64`.
+//! kind, rendered with `Document`'s `Display`. `chunks` is each type 1
+//! wrapper's `_id` and the number of rows that chunk appended.
+//! `metricTypes` names the compressor rule for each column. The Parquet
+//! values stay `u64`.
 
 use crate::errors::FileDecoderError;
 use crate::extract::MetricColumn;

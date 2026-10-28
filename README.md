@@ -37,12 +37,16 @@ raise or quiet that.
 wrapper (`_id` and `doc`) and `metadataDeltas` is every type 2 wrapper
 (`_id`, `count`, and `doc`), in file order. `count` is the periodic
 metadata encoder's generation: `0` is a full sample, and a later number
-is a sparse diff. `documentCount` counts every BSON document in the
-archive. `skippedChunkTypes` lists type numbers that were skipped.
-`metrics` is the Parquet column names, in field order. `metricTypes`
-names the compressor rule for each column (`int`, `double`, `decimal`,
-`bool`, `date`, `timestampSeconds`, `timestampIncrement`). The column
-values stay the `u64` bit patterns those rules produce.
+is a sparse diff. `chunks` is every type 1 wrapper: `_id` is the time
+the chunk was opened, and `rows` is `sample_count + 1`, the reference
+sample plus one row per delta. That `_id` is not the per-sample clock
+(`start` is an ordinary datetime metric when the collector wrote one).
+`documentCount` counts every BSON document in the archive.
+`skippedChunkTypes` lists type numbers that were skipped. `metrics` is
+the Parquet column names, in field order. `metricTypes` names the
+compressor rule for each column (`int`, `double`, `decimal`, `bool`,
+`date`, `timestampSeconds`, `timestampIncrement`). The column values
+stay the `u64` bit patterns those rules produce.
 
 `Archive::decode` takes a predicate, `|name| ...`, and passes every
 name through it once while that metric's deltas are consumed. The

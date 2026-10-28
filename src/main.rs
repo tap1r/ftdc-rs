@@ -33,8 +33,8 @@ struct Args {
     /// Also write `<name>.metadata.json` next to each Parquet file.
     ///
     /// The sidecar is relaxed extended JSON: every type 0 wrapper
-    /// (`_id` and `doc`) and every type 2 wrapper (`_id`, `count`, and
-    /// `doc`), in file order.
+    /// (`_id` and `doc`), every type 2 wrapper (`_id`, `count`, and
+    /// `doc`), and every type 1 chunk (`_id` and `rows`), in file order.
     #[arg(short, long)]
     metadata: bool,
 
